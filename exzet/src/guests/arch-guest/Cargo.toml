@@ -1,0 +1,8 @@
+[package]
+name = "exzet-arch-guest"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hyperlight-common = { git = "https://github.com/hyperlight-dev/hyperlight", branch = "main", default-features = false }
+hyperlight-guest = { git = "https://github.com/hyperlight-dev/hyperlight", branch = "main" }

@@ -1,0 +1,86 @@
+alias build-rust-debug := build-rust
+
+set windows-shell := ["pwsh.exe", "-NoLogo", "-Command"]
+set dotenv-load := true
+
+set-trace-env-vars := if os() == "windows" { "$env:RUST_LOG='none,hyperlight-host=info';" } else { "RUST_LOG=none,hyperlight-host=info" }
+set-env-command := if os() == "windows" { "$env:" } else { "export " }
+bin-suffix := if os() == "windows" { ".bat" } else { ".sh" }
+
+root := justfile_directory()
+
+default-target := "debug"
+arch_guest_source := "src/guests/arch-guest/target/x86_64-unknown-none"
+arch_guest_msvc_source := "src/guests/arch-guest/target/x86_64-pc-windows-msvc"
+rust_guests_bin_dir := "src/guests/bin"
+
+install-vcpkg:
+    cd .. && git clone https://github.com/Microsoft/vcpkg.git || cd -
+    cd ../vcpkg && ./bootstrap-vcpkg{{ bin-suffix }} && ./vcpkg integrate install || cd -
+
+install-flatbuffers-with-vcpkg: install-vcpkg
+    cd ../vcpkg && ./vcpkg install flatbuffers || cd -
+
+
+# BUILDING
+build-rust-guests target=default-target:
+    cd src/guests/arch-guest && cargo build --profile={{ if target == "debug" { "dev" } else { target } }} 
+    cd src/guests/arch-guest && cargo build --profile={{ if target == "debug" { "dev" } else { target } }} --target=x86_64-pc-windows-msvc
+
+@move-rust-guests target=default-target:
+    cp {{ arch_guest_source }}/{{ target }}/exzet-arch-guest* {{ rust_guests_bin_dir }}/{{ target }}/
+    cp {{ arch_guest_msvc_source }}/{{ target }}/exzet-arch-guest* {{ rust_guests_bin_dir }}/{{ target }}/
+
+build-and-move-rust-guests: (build-rust-guests "debug") (move-rust-guests "debug") (build-rust-guests "release") (move-rust-guests "release")
+
+# short aliases rg "rust guests", cg "c guests" for less typing
+rg: build-and-move-rust-guests
+guests: rg
+
+
+build-rust target=default-target:
+    cargo build --profile={{ if target == "debug" { "dev" } else { target } }}
+
+build: build-rust
+
+
+# RUNNING
+run target=default-target:
+    @echo "Running build step..."
+    just build-rust
+    @echo "Running build-and-move-rust-guests step..."
+    just build-and-move-rust-guests
+    @echo "Running the application..."
+    cargo run --profile={{ if target == "debug" { "dev" } else { target } }}
+
+
+
+
+# CLEANING
+clean: clean-rust
+
+clean-rust: 
+    cargo clean
+    cd src/guests/arch-guest && cargo clean
+
+# RUST LINTING
+check:
+    cargo check
+
+fmt-check:
+    cargo +nightly fmt --all -- --check
+    cargo +nightly fmt --manifest-path src/guests/arch-guest/Cargo.toml -- --check
+
+fmt-apply:
+    cargo +nightly fmt --all
+    cargo +nightly fmt --manifest-path src/guests/arch-guest/Cargo.toml
+
+clippy target=default-target:
+    cargo clippy --all-targets --all-features --profile={{ if target == "debug" { "dev" } else { target } }} -- -D warnings
+
+clippy-apply-fix-unix:
+    cargo clippy --fix --all 
+
+clippy-apply-fix-windows:
+    cargo clippy --target x86_64-pc-windows-msvc --fix --all 
+

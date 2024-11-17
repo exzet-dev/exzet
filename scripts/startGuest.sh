@@ -41,11 +41,9 @@ ROOTFS_KEY="${RES_DIR}/${ROOTFS_TYPE}.${ROOTFS_KEYTYPE}"
 
 # -------- SETUP ----------
 
-ipToMAC() {
-    local ip=$1
-    IFS='.' read -r -a octets <<< "$ip"
-    printf "06:00:%02X:%02X:%02X\n" "${octets[1]}" "${octets[2]}" "${octets[3]}"
-}
+
+ipToMAC() { IFS='.' read -r o1 o2 o3 o4 <<< "$1"; printf "06:00:%02X:%02X:%02X\n" "$o2" "$o3" "$o4"; };
+
 
 # Setup network interface
 sudo ip link del "$TAP_DEV" 2> /dev/null || true
@@ -59,26 +57,26 @@ sudo ip link set dev "$TAP_DEV" up
 
 
 # Set up microVM internet access
-# sudo iptables -t nat -D POSTROUTING -o "$HOST_IFACE" -j MASQUERADE || true
-# sudo iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT \
-#     || true
-# sudo iptables -D FORWARD -i "$TAP_DEV" -o "$HOST_IFACE" -j ACCEPT || true
-# sudo iptables -t nat -A POSTROUTING -o "$HOST_IFACE" -j MASQUERADE
-# sudo iptables -I FORWARD 1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-# sudo iptables -I FORWARD 1 -i "$TAP_DEV" -o "$HOST_IFACE" -j ACCEPT
+sudo iptables -t nat -D POSTROUTING -o "$HOST_IFACE" -j MASQUERADE || true
+sudo iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT \
+    || true
+sudo iptables -D FORWARD -i "$TAP_DEV" -o "$HOST_IFACE" -j ACCEPT || true
+sudo iptables -t nat -A POSTROUTING -o "$HOST_IFACE" -j MASQUERADE
+sudo iptables -I FORWARD 1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+sudo iptables -I FORWARD 1 -i "$TAP_DEV" -o "$HOST_IFACE" -j ACCEPT
 
-sudo iptables -t nat -C POSTROUTING -o "$HOST_IFACE" -j MASQUERADE 2>/dev/null || \
-    sudo iptables -t nat -D POSTROUTING -o "$HOST_IFACE" -j MASQUERADE || true
-sudo iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-    sudo iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || true
-sudo iptables -C FORWARD -i "$TAP_DEV" -o "$HOST_IFACE" -j ACCEPT 2>/dev/null || \
-    sudo iptables -D FORWARD -i "$TAP_DEV" -o "$HOST_IFACE" -j ACCEPT || true
-sudo iptables -t nat -C POSTROUTING -o "$HOST_IFACE" -j MASQUERADE 2>/dev/null || \
-    sudo iptables -t nat -A POSTROUTING -o "$HOST_IFACE" -j MASQUERADE
-sudo iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
-    sudo iptables -I FORWARD 1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-sudo iptables -C FORWARD -i "$TAP_DEV" -o "$HOST_IFACE" -j ACCEPT 2>/dev/null || \
-    sudo iptables -I FORWARD 1 -i "$TAP_DEV" -o "$HOST_IFACE" -j ACCEPT
+# sudo iptables -t nat -C POSTROUTING -o "$HOST_IFACE" -j MASQUERADE 2>/dev/null || \
+#     sudo iptables -t nat -D POSTROUTING -o "$HOST_IFACE" -j MASQUERADE || true
+# sudo iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+#     sudo iptables -D FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT || true
+# sudo iptables -C FORWARD -i "$TAP_DEV" -o "$HOST_IFACE" -j ACCEPT 2>/dev/null || \
+#     sudo iptables -D FORWARD -i "$TAP_DEV" -o "$HOST_IFACE" -j ACCEPT || true
+# sudo iptables -t nat -C POSTROUTING -o "$HOST_IFACE" -j MASQUERADE 2>/dev/null || \
+#     sudo iptables -t nat -A POSTROUTING -o "$HOST_IFACE" -j MASQUERADE
+# sudo iptables -C FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || \
+#     sudo iptables -I FORWARD 1 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+# sudo iptables -C FORWARD -i "$TAP_DEV" -o "$HOST_IFACE" -j ACCEPT 2>/dev/null || \
+#     sudo iptables -I FORWARD 1 -i "$TAP_DEV" -o "$HOST_IFACE" -j ACCEPT
 
 
 # THE API SOCKET FOR THE VM

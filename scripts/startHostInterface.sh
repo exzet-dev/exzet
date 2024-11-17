@@ -26,4 +26,4 @@ FIRECRACKER="${RES_DIR}/firecracker"
 
 API_SOCKET="${SOCKETS_DIR}/firecracker-${SB_ID}.socket"
 sudo rm -f $API_SOCKET
-sudo ./firecracker --api-sock "${API_SOCKET}"
+sudo $FIRECRACKER --api-sock "${API_SOCKET}"

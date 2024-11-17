@@ -33,3 +33,4 @@ sudo ./firecracker_src/tools/devtool build
 
 # Rename the binary to "firecracker"
 sudo cp ./firecracker_src/build/cargo_target/${ARCH}-unknown-linux-musl/debug/firecracker "${TARGET_DIR}firecracker"
+sudo cp "${TARGET_DIR}firecracker" /usr/local/bin/firecracker

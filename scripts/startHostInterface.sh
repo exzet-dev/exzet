@@ -10,7 +10,7 @@ HOST_IFACE=$(ip route get 1.1.1.1 | grep -Po '(?<=dev\s)\w+' | cut -f1 -d ' ')
 
 # Setup TAP device that uses proxy ARP
 MASK_SHORT="/30"
-TAP_IP="$(printf '169.254.%s.%s' $(((4 * SB_ID + 2) / 256)) $(((4 * SB_ID + 2) % 256)))"
+TAP_IP="172.16.0.$((4 * SB_ID + 1))"
 
 # Get Paths
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)

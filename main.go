@@ -2,89 +2,89 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
+	"path/filepath"
+	"time"
 
-	"github.com/firecracker-microvm/firecracker-go-sdk"
+	"github.com/exzet-dev/exzet/pkg/logger"
+	"github.com/exzet-dev/exzet/pkg/task"
+	"github.com/exzet-dev/exzet/pkg/vm"
 )
 
 func main() {
-	// Define paths for the kernel and rootfs
-	kernelPath := "./vmlinux"     // Replace with your kernel image path
-	rootfsPath := "./rootfs.ext4" // Replace with your rootfs path
-
-	// Set up the logger
-	logger := log.New(os.Stdout, "firecracker", log.LstdFlags|log.Lmicroseconds)
-
-	// Create a context for the microVM
-	ctx := context.Background()
-
-	// Configure Firecracker machine
-	machineConfig := firecracker.MachineConfig{
-		VcpuCount:  1,
-		MemSizeMib: 128,
-		HtEnabled:  false,
+	if err := logger.Init("exzet.log"); err != nil {
+		log.Fatalf("Failed to initialize logger: %v", err)
 	}
+	logger.Log.Info("Starting Exzet pipeline manager...")
 
-	// Define drive configuration
-	drive := firecracker.BlockDevice{
-		HostPath:     firecracker.String(rootfsPath),
-		Mode:         "rw",
-		IsRootDevice: firecracker.Bool(true),
-		IsReadOnly:   firecracker.Bool(false),
-	}
-
-	// Define network configuration
-	network := firecracker.NetworkInterface{
-		MacAddress:  "AA:FC:00:00:00:01",
-		HostDevName: "tap0", // Ensure tap0 is created and configured on the host
-		AllowMMDS:   true,
-	}
-
-	// Define VM configuration
-	vmConfig := firecracker.Config{
-		SocketPath:      "firecracker.sock",
-		LogFifo:         "firecracker-log.fifo",
-		MetricsFifo:     "firecracker-metrics.fifo",
-		KernelImagePath: kernelPath,
-		MachineCfg:      machineConfig,
-		Drives:          []firecracker.BlockDevice{drive},
-		NetworkInterfaces: []firecracker.NetworkInterface{
-			network,
-		},
-	}
-
-	// Create a new Firecracker VM
-	cmd := firecracker.VMCommandBuilder{}.
-		WithBin("/usr/local/bin/firecracker").
-		WithSocketPath("firecracker.sock").
-		Build(ctx)
-
-	machine, err := firecracker.NewMachine(ctx, vmConfig, firecracker.WithLogger(logger), firecracker.WithProcessRunner(cmd))
+	// Setup VM configuration
+	dir, err := os.Getwd()
 	if err != nil {
-		log.Fatalf("Failed to create Firecracker machine: %v", err)
+		log.Fatalf("Failed to get current directory: %v", err)
 	}
 
-	// Start the machine
-	if err := machine.Start(ctx); err != nil {
-		log.Fatalf("Failed to start Firecracker machine: %v", err)
+	resourceDir := filepath.Join(dir, "resources")
+	socketDir, err := os.MkdirTemp("", "FC_SOCKET_DIR")
+	if err != nil {
+		log.Fatal(err)
+	}
+	vmConfig := vm.VMConfig{
+		SocketPath:      filepath.Join(socketDir, "firecracker.sock"),
+		KernelImagePath: filepath.Join(resourceDir, "vmlinux"),
+		RootfsPath:      filepath.Join(resourceDir, "ubuntu-22.04.ext4"),
+		SSHKeyPath:      filepath.Join(resourceDir, "ubuntu-22.04.id_rsa"),
+		CNIConfDir:      filepath.Join(dir, "cni.conf"),
+		CNIBinDir:       filepath.Join(dir, "bin"),
+		NetworkName:     "fcnet",
+		Subnet:          "10.168.0.0/24",
+		TAPName:         "veth0",
+		VMIP:            "10.168.0.2",
+	}
+
+	// Start the VM
+	ctx := context.Background()
+	machine, err := vm.StartVM(ctx, vmConfig)
+	if err != nil {
+		log.Fatalf("Failed to start VM: %v", err)
 	}
 	defer func() {
-		// Clean up the VM after execution
 		if err := machine.StopVMM(); err != nil {
-			log.Printf("Failed to stop Firecracker machine: %v", err)
+			log.Printf("Error stopping VM: %v", err)
 		}
 	}()
 
-	// Run a command inside the VM
-	command := "/bin/echo 'Hello from Firecracker!'"
-	result, err := machine.Handlers.FcClient.ExecuteGuestCommand(ctx, firecracker.ExecuteGuestCommandInput{
-		Command: command,
-	})
-	if err != nil {
-		log.Fatalf("Failed to execute command in Firecracker machine: %v", err)
-	}
+	// Wait for the VM to boot
+	time.Sleep(5 * time.Second)
 
-	fmt.Printf("Command output: %s\n", result.Stdout)
+	defer func() {
+		if err := machine.StopVMM(); err != nil {
+			log.Fatal(err)
+		}
+	}()
+	defer func() {
+		if err := machine.Shutdown(ctx); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	// Connect to the VM via SSH
+	client, err := task.ConnectToVM(machine, vmConfig.SSHKeyPath)
+	if err != nil {
+		log.Fatalf("Failed to connect to VM via SSH: %v", err)
+	}
+	defer client.Close()
+
+	// Execute a task inside the VM
+	// exampleTask := &task.Task{
+	// 	Command: "echo Hello from Exzet!",
+	// }
+
+	output, err := task.RunCommandInVM(client, "echo Hello from Exzet! && ls -a && pwd && id && env")
+	if err != nil {
+		logger.Log.Fatalf("Failed to run task in VM: %v", err)
+	}
+	logger.Log.Infof("Task Output: %s", output)
+	log.Printf("Task Output: %s", output)
+	log.Println("Exzet pipeline manager completed successfully.")
 }

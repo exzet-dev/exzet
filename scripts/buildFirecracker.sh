@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+if [ "$(id -u)" -ne 0 ]; then echo "Root is needed for build, please run with sudo or as root user." >&2; exit 1; fi
+
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 BIN_DIR=$(cd "$SCRIPT_DIR/.." && mkdir -p bin && cd bin && pwd)
 BUILD_DIR=$(cd "$SCRIPT_DIR/.." && mkdir -p build && cd build && pwd)
@@ -30,4 +32,4 @@ sudo systemctl start docker
 sudo ./firecracker_src/tools/devtool build
 
 # Rename the binary to "firecracker"
-#sudo cp ./firecracker_src/build/cargo_target/${ARCH}-unknown-linux-musl/debug/firecracker firecracker
+sudo cp ./firecracker_src/build/cargo_target/${ARCH}-unknown-linux-musl/debug/firecracker "${TARGET_DIR}firecracker"

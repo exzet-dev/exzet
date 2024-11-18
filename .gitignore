@@ -30,7 +30,6 @@ bld/
 [Bb]in/
 build/
 fs/
-resources/
 [Oo]bj/
 [Ll]og/
 [Ll]ogs/
@@ -401,3 +400,4 @@ FodyWeavers.xsd
 *.sln.iml
 exzet
 old/
+/resources/

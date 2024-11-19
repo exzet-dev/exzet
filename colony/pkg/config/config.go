@@ -78,7 +78,8 @@ func WriteCNIConf(cniConfDir, networkName, subnet string) error {
 				"type": "ptp",
 				"ipam": {
 					"type": "host-local",
-					"subnet": "%s"
+					"subnet": "%s",
+					"resolvConf": "/etc/resolv.conf"
 				}
 			},
 			{

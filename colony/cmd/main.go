@@ -37,15 +37,7 @@ func main() {
 
 	combinedCommand := fmt.Sprintf(`
 	#!/bin/sh
-	# Bring up the interface
-	ip link set dev eth0 up &&
-	# Assign IP address to the interface
-	ip addr add %s dev eth0 &&
-	# Add the default gateway
-	ip route add default via 10.168.0.1 &&
-	# Update the resolv.conf for DNS
-	echo -e "nameserver 8.8.8.8\nnameserver 8.8.4.4" > /etc/resolv.conf
-	`, machineIp)
+	ip route add default via %v dev eth0 && echo 'nameserver 8.8.8.8' > /etc/resolv.conf`, machineIp)
 
 	// Send the task to configure networking on the VM
 	out, err := provision.SendTask(fmt.Sprintf("%v", machineIp), tasks.Task{

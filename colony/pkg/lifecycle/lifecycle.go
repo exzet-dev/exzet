@@ -24,7 +24,7 @@ func CreateVM(name string) (*sdk.Machine, config.VMConfig, error) {
 		KernelImagePath: utils.GetResourcePath("vmlinux"),
 		RootfsPath:      utils.GetResourcePath("rootfs.ext4"),
 		NetworkName:     "fcnet",
-		Subnet:          "10.168.0.0/24",
+		Subnet:          "10.168.0.0/16",
 		TAPName:         "veth0",
 		VMIP:            "10.168.0.2",
 		CNIConfDir:      utils.GetResourcePath("cni.conf"),

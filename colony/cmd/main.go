@@ -7,10 +7,13 @@ import (
 	"exzet-colony/pkg/utils"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 )
 
 func main() {
+	go startHealthCheckServer()
+
 	// Write resources to accessible location
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -18,16 +21,17 @@ func main() {
 		return
 	}
 
-	utils.WriteAllEmbeddedResources(fmt.Sprintf("%v/resources", cwd))
+	resDir := fmt.Sprintf("%v/resources", cwd)
+	utils.WriteAllEmbeddedResources(resDir)
+	utils.CleanupBackups(resDir)
+	utils.CopySystemFiles(resDir)
 
-	// Send the Task to a node
+	// Create and configure VM
 	m, cfg, err := lifecycle.CreateVM("TESTVM0001")
 	if err != nil {
 		fmt.Printf("Error creating VM: %v\n", err)
 		return
 	}
-
-	machineIp := m.Cfg.NetworkInterfaces[0].StaticConfiguration.IPConfiguration.IPAddr.IP
 
 	defer func() {
 		if err := lifecycle.StopVM(cfg.SocketPath); err != nil {
@@ -35,71 +39,29 @@ func main() {
 		}
 	}()
 
-	combinedCommand := fmt.Sprintf(`
-	#!/bin/sh
-	ip route add default via %v dev eth0 && echo 'nameserver 8.8.8.8' > /etc/resolv.conf`, machineIp)
-
-	// Send the task to configure networking on the VM
-	out, err := provision.SendTask(fmt.Sprintf("%v", machineIp), tasks.Task{
-		ID:      "setup-network",
-		Command: "sh",
-		Args:    []string{"-c", combinedCommand},
-	})
-	if err != nil {
-		fmt.Printf("Error during network configuration and verification: %v\n", err)
-	} else {
-		fmt.Printf("Network configuration and verification successful:\n%v\n", out)
-	}
-
-	combinedCommand = `sh -c "
-		systemctl enable NetworkManager &&
-		echo 'nameserver 8.8.8.8\nnameserver 8.8.4.4' > /etc/resolv.conf &&
-		echo 'Updated /etc/resolv.conf' &&
-		sleep 1 &&
-		echo 'Contents of /etc/resolv.conf:' &&
-		cat /etc/resolv.conf &&
-		sleep 1 &&
-		systemctl restart NetworkManager &&
-		sleep 5 &&
-		echo 'Pinging google.com...' &&
-		ping -c 4 google.com &&
-		echo 'Displaying IP configuration:' &&
-		ip a &&
-		echo 'Displaying routing table:' &&
-		ip route &&
-		echo 'Sleeping for 5 seconds...' &&
-		sleep 1"`
-
-	out, err = provision.SendTask(fmt.Sprintf("%v", machineIp), tasks.Task{
-		ID:      "network-config-full",
-		Command: "sh",
-		Args:    []string{"-c", combinedCommand},
-	})
-	if err != nil {
-		fmt.Printf("Error during network configuration and verification: %v\n", err)
-	} else {
-		fmt.Printf("Network configuration and verification successful:\n%v\n", out)
-	}
-
-	out, err = provision.SendTask(fmt.Sprintf("%v", machineIp), tasks.Task{
-		ID:      "124",
+	// Your task execution code can now be much simpler
+	machineIP := m.Cfg.NetworkInterfaces[0].StaticConfiguration.IPConfiguration.IPAddr.IP
+	out, err := provision.SendTask(machineIP.String(), tasks.Task{
+		ID:      "test-task",
 		Command: "echo",
-		Args:    []string{"I AM IN A VM MOFUGGGGGAAAA"},
+		Args:    []string{"VM is ready for tasks!"},
 	})
 	if err != nil {
 		fmt.Printf("Error sending task: %v\n", err)
 	} else {
 		fmt.Printf("Task executed successfully: %v\n", out)
 	}
+}
 
-	out, err = provision.SendTask(fmt.Sprintf("%v", machineIp), tasks.Task{
-		ID:      "125",
-		Command: "ping",
-		Args:    []string{"google.com"},
+func startHealthCheckServer() {
+	http.HandleFunc("/healthcheck", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintln(w, "OK (COLONY ALIVE)")
 	})
-	if err != nil {
-		fmt.Printf("Error sending task: %v\n", err)
-	} else {
-		fmt.Printf("Task executed successfully: %v\n", out)
+
+	port := "8086"
+	log.Printf("Starting health check server on port %s\n", port)
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Fatalf("Health check server failed: %v\n", err)
 	}
 }

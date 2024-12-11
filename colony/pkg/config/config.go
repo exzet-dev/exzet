@@ -15,6 +15,7 @@ type VMConfig struct {
 	BinPath         string
 	KernelImagePath string
 	RootfsPath      string
+	InitrdPath      string
 	SSHKeyPath      string
 	CNIConfDir      string
 	CNIBinDir       string
@@ -27,10 +28,45 @@ type VMConfig struct {
 	Smt             bool
 }
 
+func WriteCNIConf(cniConfDir, networkName, subnet string) error {
+	err := os.MkdirAll(cniConfDir, 0755)
+	if err != nil {
+		return fmt.Errorf("failed to create CNI config directory: %v", err)
+	}
+
+	cniConfPath := filepath.Join(cniConfDir, fmt.Sprintf("%s.conflist", networkName))
+
+	// MATCH THE EXAMPLE'S CNI CONFIG
+	conf := fmt.Sprintf(`{
+        "cniVersion": "0.3.1",
+        "name": "%s",
+        "plugins": [
+            {
+                "type": "ptp",
+                "ipam": {
+                    "type": "host-local",
+                    "subnet": "%s"
+                }
+            },
+            {
+                "type": "tc-redirect-tap"
+            }
+        ]
+    }`, networkName, subnet)
+
+	return os.WriteFile(cniConfPath, []byte(conf), 0644)
+}
+
 func (cfg *VMConfig) CreateMachineConfig() sdk.Config {
+	// CREATE DRIVE CONFIG
+	driveID := "root"
+	isRootDevice := true
+	isReadOnly := false
+
 	return sdk.Config{
 		SocketPath:      cfg.SocketPath,
 		KernelImagePath: cfg.KernelImagePath,
+		InitrdPath:      cfg.InitrdPath,
 		MachineCfg: models.MachineConfiguration{
 			VcpuCount:  &cfg.VcpuCount,
 			MemSizeMib: &cfg.MemSizeMib,
@@ -38,10 +74,10 @@ func (cfg *VMConfig) CreateMachineConfig() sdk.Config {
 		},
 		Drives: []models.Drive{
 			{
-				DriveID:      sdk.String("root"),
+				DriveID:      &driveID,
+				IsRootDevice: &isRootDevice,
+				IsReadOnly:   &isReadOnly,
 				PathOnHost:   &cfg.RootfsPath,
-				IsRootDevice: sdk.Bool(true),
-				IsReadOnly:   sdk.Bool(false),
 			},
 		},
 		NetworkInterfaces: []sdk.NetworkInterface{
@@ -59,38 +95,18 @@ func (cfg *VMConfig) CreateMachineConfig() sdk.Config {
 	}
 }
 
-func WriteCNIConf(cniConfDir, networkName, subnet string) error {
-	// Ensure the directory exists
-	err := os.MkdirAll(cniConfDir, 0755)
-	if err != nil {
-		return fmt.Errorf("failed to create CNI config directory: %v", err)
+// ADD CLEANUP FOR CNI
+func CleanupCNI(cfg *VMConfig) error {
+	// Remove CNI cache directory
+	cniCacheDir := "/var/lib/cni"
+	if err := os.RemoveAll(cniCacheDir); err != nil {
+		return fmt.Errorf("failed to cleanup CNI cache: %v", err)
 	}
 
-	// Construct the path for the CNI config file
-	cniConfPath := filepath.Join(cniConfDir, fmt.Sprintf("%s.conflist", networkName))
-	cniVersion := "0.3.1"
-	// Write the configuration to the file
-	conf := fmt.Sprintf(`{
-		"cniVersion": "%s",
-		"name": "%s",
-		"plugins": [
-			{
-				"type": "ptp",
-				"ipam": {
-					"type": "host-local",
-					"subnet": "%s",
-					"resolvConf": "/etc/resolv.conf"
-				}
-			},
-			{
-				"type": "tc-redirect-tap"
-			}
-		]
-	}`, cniVersion, networkName, subnet)
-
-	err = os.WriteFile(cniConfPath, []byte(conf), 0644)
-	if err != nil {
-		return fmt.Errorf("failed to write CNI config file: %v", err)
+	// Remove CNI configuration
+	cniConfPath := filepath.Join(cfg.CNIConfDir, fmt.Sprintf("%s.conflist", cfg.NetworkName))
+	if err := os.RemoveAll(cniConfPath); err != nil {
+		return fmt.Errorf("failed to remove CNI config: %v", err)
 	}
 
 	return nil

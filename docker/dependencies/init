@@ -1,0 +1,93 @@
+#!/bin/sh
+
+print_banner() {
+    cat << "EOF"
+███████╗██╗  ██╗███████╗███████╗████████╗
+██╔════╝╚██╗██╔╝╚══███╔╝██╔════╝╚══██╔══╝
+█████╗   ╚███╔╝   ███╔╝ █████╗     ██║   
+██╔══╝   ██╔██╗  ███╔╝  ██╔══╝     ██║   
+███████╗██╔╝ ██╗███████╗███████╗   ██║   
+╚══════╝╚═╝  ╚═╝╚══════╝╚══════╝   ╚═╝   
+[SPAWN KERNEL v1.0] >>>>> INITIALIZING...
+EOF
+}
+
+wait_for_net() {
+    # WAIT FOR NETWORK INTERFACE WITH INCREASED TIMEOUT
+    for i in $(seq 1 10); do
+        if ip link show eth0 >/dev/null 2>&1; then
+            break
+        fi
+        echo "WAITING FOR ETH0... ${i}"
+        sleep 1
+    done
+}
+
+setup_network() {
+    # FASTER NETWORK SETUP - NO SLEEP TILL IM DEAD
+    wait_for_net
+    ip link set eth0 up
+    # CHANGED TO /24 TO MATCH HOST CONFIG
+    ip addr add 10.168.0.2/24 dev eth0
+    ip route add default via 10.168.0.1
+    
+    # VERIFY AND LOG
+    echo "[NET] CONFIG >>"
+    ip addr show
+    ip link show
+    ip route show
+
+    # TRY TO PING GATEWAY
+    if ping -c 1 -W 2 10.168.0.1 >/dev/null 2>&1; then
+        echo "NETWORK CONNECTIVITY VERIFIED"
+    else
+        echo "WARNING: CANNOT PING GATEWAY"
+    fi
+}
+
+mount_essentials() {
+    # MOUNT ESSENTIALS
+    mount -t proc proc /proc || echo "FAILED TO MOUNT PROC"
+    mount -t sysfs sysfs /sys || echo "FAILED TO MOUNT SYSFS"
+    
+    # TRY DEV TMPFS
+    mount -t devtmpfs devtmpfs /dev || echo "FAILED TO MOUNT DEVTMPFS"
+}
+
+mount_workspace() {
+    # OPTIMIZED BLOCK DEVICE CHECK
+    for dev in vda xvda hda; do
+        [ -b "/dev/${dev}" ] && {
+            mount /dev/${dev} /workspace && return 0
+        }
+    done
+    return 1
+}
+
+main() {
+    print_banner
+    
+    # FAST PARALLEL SETUP
+    mount_essentials
+    
+    echo "[SYS] KERNEL: $(uname -r)"
+    
+    # MOUNT WORKSPACE
+    mount_workspace || {
+        echo "[ERR] WORKSPACE MOUNT FAILED"
+        echo "[DBG] DEVICES: $(ls -1 /dev | grep -E '^[hvx]d[a-z]$')"
+        exec /bin/sh
+    }
+    
+    echo "[SYS] WORKSPACE MOUNTED"
+    
+    # SETUP NETWORK
+    setup_network
+    
+    # START SPAWN
+    echo "[SYS] LAUNCHING TASK EXECUTOR..."
+    exec /bin/sh
+}
+
+# RUN MAIN WITH ERROR HANDLING
+main || exec /bin/sh

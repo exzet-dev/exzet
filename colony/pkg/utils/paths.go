@@ -1,10 +1,16 @@
 package utils
 
 import (
+	"bytes"
 	"exzet-colony/pkg/resources"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+)
+
+const (
+	ExternalResourcesDir = "build/output"
 )
 
 // GetResourcePath retrieves the path to an embedded resource.
@@ -59,6 +65,86 @@ func WriteEmbeddedResource(resourceName, outputPath string) error {
 	err = os.Chmod(outputPath, 0755) // Add execute permissions
 	if err != nil {
 		return fmt.Errorf("failed to set execute permissions for %s: %w", resourceName, err)
+	}
+
+	return nil
+}
+
+func CopySystemFiles(baseDir string) error {
+	cwd, _ := os.Getwd()
+	sourceDir := filepath.Join(cwd, ExternalResourcesDir)
+
+	// FIRST CHECK IF DIRECTORY EXISTS
+	if err := os.MkdirAll(baseDir, 0755); err != nil {
+		return fmt.Errorf("failed to create destination directory: %w", err)
+	}
+
+	entries, err := os.ReadDir(sourceDir)
+	if err != nil {
+		return fmt.Errorf("failed to read source directory: %w", err)
+	}
+
+	for _, entry := range entries {
+		sourcePath := filepath.Join(sourceDir, entry.Name())
+		destPath := filepath.Join(baseDir, entry.Name())
+
+		// CHECK IF FILE ALREADY EXISTS
+		if _, err := os.Stat(destPath); err == nil {
+			// FILE EXISTS, COMPARE CONTENTS
+			sourceData, err := os.ReadFile(sourcePath)
+			if err != nil {
+				return fmt.Errorf("failed to read source %s: %w", entry.Name(), err)
+			}
+
+			destData, err := os.ReadFile(destPath)
+			if err != nil {
+				return fmt.Errorf("failed to read destination %s: %w", entry.Name(), err)
+			}
+
+			if bytes.Equal(sourceData, destData) {
+				continue // Files are identical, skip
+			}
+
+			// Files differ, backup existing
+			backupPath := destPath + ".bak"
+			if err := os.Rename(destPath, backupPath); err != nil {
+				return fmt.Errorf("failed to backup %s: %w", entry.Name(), err)
+			}
+		}
+
+		// COPY FILE
+		data, err := os.ReadFile(sourcePath)
+		if err != nil {
+			return fmt.Errorf("failed to read %s: %w", entry.Name(), err)
+		}
+
+		// PRESERVE ORIGINAL FILE MODE IF IT EXISTS
+		fileMode := os.FileMode(0644)
+		if info, err := os.Stat(sourcePath); err == nil {
+			fileMode = info.Mode()
+		}
+
+		if err := os.WriteFile(destPath, data, fileMode); err != nil {
+			return fmt.Errorf("failed to write %s: %w", entry.Name(), err)
+		}
+	}
+
+	return nil
+}
+
+func CleanupBackups(baseDir string) error {
+	entries, err := os.ReadDir(baseDir)
+	if err != nil {
+		return fmt.Errorf("failed to read directory: %w", err)
+	}
+
+	for _, entry := range entries {
+		if strings.HasSuffix(entry.Name(), ".bak") {
+			path := filepath.Join(baseDir, entry.Name())
+			if err := os.Remove(path); err != nil {
+				return fmt.Errorf("failed to remove backup %s: %w", entry.Name(), err)
+			}
+		}
 	}
 
 	return nil

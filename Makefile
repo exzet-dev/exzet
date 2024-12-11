@@ -1,26 +1,26 @@
-# Define directories for each service
+# DEFINE DIRECTORIES FOR EACH SERVICE
 BRAIN_DIR := brain/cmd
 COLONY_DIR := colony/cmd
 SPAWN_DIR := spawn/cmd
 HIVE_DIR := hive/cmd
 HIVEVIEW_DIR := hiveview
 
-# Define build output directory and names
+# DEFINE BUILD OUTPUT DIRECTORY AND NAMES
 BIN_DIR := bin
 BRAIN_BIN := $(BIN_DIR)/brain
 COLONY_BIN := $(BIN_DIR)/colony
 SPAWN_BIN := $(BIN_DIR)/spawn
 HIVE_BIN := $(BIN_DIR)/hive
 
-# Ensure the bin directory exists
+# ENSURE BIN DIRECTORY EXISTS
 $(BIN_DIR):
 	@mkdir -p $(BIN_DIR)
 
-# Default target
+# DEFAULT TARGET
 .PHONY: all
 all: build
 
-# Build all components
+# BUILD ALL COMPONENTS
 .PHONY: build
 build: $(BIN_DIR) build-brain build-colony build-spawn build-hive
 
@@ -28,6 +28,13 @@ build: $(BIN_DIR) build-brain build-colony build-spawn build-hive
 build-brain: $(BIN_DIR)
 	@echo "Building Brain Service..."
 	cd $(BRAIN_DIR) && go build -o ../../$(BRAIN_BIN)
+
+.PHONY: build-colony-deps
+build-colony-deps: build-spawn $(BIN_DIR)
+	@echo "Running Kernel and FS Build Script..."
+	./scripts/buildKernelAndFS.sh
+	@echo "Building Colony Service..."
+	cd $(COLONY_DIR) && go build -o ../../$(COLONY_BIN)
 
 .PHONY: build-colony
 build-colony: $(BIN_DIR)
@@ -37,7 +44,7 @@ build-colony: $(BIN_DIR)
 .PHONY: build-spawn
 build-spawn: $(BIN_DIR)
 	@echo "Building Spawn Service..."
-	cd $(SPAWN_DIR) && go build -o ../../$(SPAWN_BIN)
+	cd $(SPAWN_DIR) && CGO_ENABLED=0 go build -ldflags="-s -w" -o ../../$(SPAWN_BIN)
 
 .PHONY: build-hive
 build-hive: build-hiveview $(BIN_DIR)
@@ -49,7 +56,7 @@ build-hiveview:
 	@echo "Building HiveView Frontend..."
 	cd $(HIVEVIEW_DIR) && npm install && npm run build
 
-# Run all components
+# RUN ALL COMPONENTS
 .PHONY: run
 run: run-brain run-colony run-spawn run-hive
 
@@ -78,26 +85,39 @@ run-hiveview:
 	@echo "Running HiveView Frontend..."
 	cd $(HIVEVIEW_DIR) && npm run dev
 
-# Clean build artifacts
+.PHONY: run-qemu
+run-qemu:
+	@echo "Running Colony & Spawn in QEMU vm..."
+	qemu-system-x86_64 \
+		-kernel build/output/bzImage \
+		-initrd build/output/initramfs.cpio.xz \
+		-drive file=build/output/root.img,format=raw \
+		-append "root=/dev/vda rw console=ttyS0" \
+		-nographic \
+		-enable-kvm \
+		-m 1024M \
+		-smp 2
+
+# CLEAN BUILD ARTIFACTS
 .PHONY: clean
 clean:
 	@echo "Cleaning build artifacts..."
 	rm -rf $(BIN_DIR)
 	cd $(HIVEVIEW_DIR) && rm -rf node_modules build
 
-# Setup development environment
+# SETUP DEVELOPMENT ENVIRONMENT
 .PHONY: setup
 setup:
 	@echo "Setting up development environment..."
 	./scripts/setup-dev-env.sh
 
-# Help message
+# HELP MESSAGE
 .PHONY: help
 help:
 	@echo "Available targets:"
 	@echo "  build            - Build all components"
 	@echo "  build-brain      - Build Brain service"
-	@echo "  build-colony     - Build Colony service"
+	@echo "  build-colony     - Build Colony service (includes spawn and kernel/fs)"
 	@echo "  build-spawn      - Build Spawn service"
 	@echo "  build-hive       - Build Hive Backend service (depends on build-hiveview)"
 	@echo "  build-hiveview   - Build HiveView Frontend"

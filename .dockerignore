@@ -1,0 +1,29 @@
+# Binary files and builds
+**/dist/
+**/target/
+
+# Dev environment
+**/.git/
+**/.vscode/
+**/.idea/
+**/.env
+
+# Dependencies
+**/node_modules/
+**/vendor/
+
+# Misc
+**/*.log
+**/*.tmp
+**/tmp/
+**/.DS_Store
+
+# VM artifacts (unless specifically needed)
+vm-artifacts/
+
+**/*.sock
+**/old/
+**/*.bak
+**/.git/
+**/target/
+**/*.log

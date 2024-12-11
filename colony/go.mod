@@ -9,7 +9,7 @@ require (
 	github.com/containerd/fifo v1.0.0 // indirect
 	github.com/containernetworking/cni v1.0.1 // indirect
 	github.com/containernetworking/plugins v1.0.1 // indirect
-	github.com/firecracker-microvm/firecracker-go-sdk v1.0.0 // indirect
+	github.com/firecracker-microvm/firecracker-go-sdk v1.0.0 // direct
 	github.com/go-openapi/analysis v0.21.2 // indirect
 	github.com/go-openapi/errors v0.20.2 // indirect
 	github.com/go-openapi/jsonpointer v0.19.5 // indirect

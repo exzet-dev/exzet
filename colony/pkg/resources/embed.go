@@ -6,7 +6,7 @@ import (
 	"path"
 )
 
-//go:embed bin/* fc.stamp firecracker jailer rootfs.ext4 rootfs.id_rsa vmlinux
+//go:embed bin/* fc.stamp firecracker jailer rootfs.id_rsa
 var resources embed.FS
 
 // GetResource returns the content of a specific resource file.

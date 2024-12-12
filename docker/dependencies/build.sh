@@ -7,8 +7,10 @@ set -euo pipefail
 # PATHS
 BUILD_ROOT="/build"
 KERNEL_DIR="${BUILD_ROOT}/linux-${KERNEL_VERSION}"
-KERNEL_CONF="${BUILD_ROOT}/microvm-kernel-ci-x86_64-${KERNEL_VERSION}.config"
+CONFIG_DIR="${BUILD_ROOT}/config"
+KERNEL_CONF="${CONFIG_DIR}/microvm-kernel-ci-x86_64-${KERNEL_VERSION}.config"
 ROOTFS_DIR="${BUILD_ROOT}/rootfs"
+
 WORKSPACE_SIZE="4096" # SIZE IN MB
 
 # KERNEL BUILD

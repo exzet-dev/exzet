@@ -1,0 +1,20 @@
+FROM ubuntu
+
+WORKDIR /workspace
+
+# DEPS
+RUN apt-get update && apt-get install -y \
+	curl \
+	build-essential \
+    debootstrap \
+    docker.io \
+	git \
+	&& rm -rf /var/lib/apt/lists/*
+
+COPY bin/spawn ./spawn
+COPY docker/dependencies/* ./
+RUN chmod +x ./create-rootfs.sh
+
+VOLUME /output
+
+ENTRYPOINT ["./create-rootfs.sh"]

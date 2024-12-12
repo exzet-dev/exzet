@@ -61,8 +61,6 @@ ENV KERNEL_VERSION=6.1
 ENV SYSTEMD_VERSION=254
 
 WORKDIR /build
-
-# COPY ONLY WHAT'S NEEDED
 COPY bin/spawn /build/spawn
 COPY docker/dependencies/* /build/
 RUN chmod +x /build/build.sh

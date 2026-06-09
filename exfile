@@ -1,0 +1,13 @@
+# image := rust:1
+# servers := token@host:7433
+
+check:
+    cargo check
+
+build:
+    cargo build
+
+# [outputs: target/release/exzec target/release/exzed]
+[time: 10m]
+release:
+    cargo build --release

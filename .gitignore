@@ -431,3 +431,5 @@ FodyWeavers.xsd
 *.msp
 /target
 !src/bin/*
+
+RULES.md

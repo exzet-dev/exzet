@@ -6,8 +6,12 @@ exzed (daemon) + exzec (client) + exfile (task file) = exzet
 ## Install
 
 ```sh
-cargo install --git https://github.com/nickheyer/exzet
+curl -fsSL https://exzet.net/install.sh | sh
 ```
+
+Static binaries (`exzec` + `exzed`), x86_64/aarch64 linux, also on [releases](https://github.com/exzet-dev/exzet/releases).
+
+From source: `cargo install --git https://github.com/exzet-dev/exzet`
 
 Start exzed and copy server entry from log:
 

@@ -1,5 +1,7 @@
 use anyhow::{bail, Context, Result};
-use exzet::exfile;
+use exzet::cas::{self, Scan};
+use exzet::cell;
+use exzet::exfile::{self, Task};
 use exzet::nfs::WorkspaceFs;
 use exzet::proto::{self, Frame, Msg};
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
@@ -7,8 +9,12 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
 
+#[derive(Clone)]
 struct Server {
     addr: String,
     token: String,
@@ -27,40 +33,61 @@ async fn main() {
 
 async fn run() -> Result<i32> {
     let mut live_flag = false;
+    let mut detach = false;
     let mut cli_servers: Vec<String> = Vec::new();
     let mut exfile_arg: Option<String> = None;
-    let mut name: Option<String> = None;
+    let mut pos: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--live" => live_flag = true,
+            "--detach" | "-d" => detach = true,
             "--server" => cli_servers.push(args.next().context("--server needs [token@]host[:port]")?),
             "--exfile" | "-f" => exfile_arg = Some(args.next().context("-f needs a path")?),
             "-h" | "--help" => {
-                println!("usage: exzec [--live] [--server token@host:port]... [-f exfile] [task]");
+                println!("usage: exzec [--live] [--detach] [--server token@host:port]... [-f exfile] [task]");
+                println!("       exzec ps | attach <job>");
                 println!("no task: list tasks from the nearest exfile");
                 return Ok(0);
             }
             f if f.starts_with('-') => bail!("unknown flag '{f}'"),
-            t => {
-                if name.is_some() {
-                    bail!("one task at a time");
-                }
-                name = Some(t.to_string());
-            }
+            t => pos.push(t.to_string()),
         }
     }
-    let (root, file) = match &exfile_arg {
+    let found = match &exfile_arg {
         Some(p) => {
             let file = std::fs::canonicalize(p).with_context(|| p.clone())?;
             let root = file.parent().context("-f needs a file path")?.to_path_buf();
-            (root, file)
+            Ok((root, file))
         }
-        None => exfile::resolve(&std::env::current_dir()?)?,
+        None => exfile::resolve(&std::env::current_dir()?),
     };
+    if matches!(pos.first().map(String::as_str), Some("ps") | Some("attach")) {
+        let (root, file_servers) = match &found {
+            Ok((root, file)) => {
+                let servers = std::fs::read_to_string(file)
+                    .ok()
+                    .and_then(|t| exfile::parse(&t).ok())
+                    .and_then(|ts| ts.into_iter().next().map(|t| t.servers))
+                    .unwrap_or_default();
+                (root.clone(), servers)
+            }
+            Err(_) => (std::env::current_dir()?, Vec::new()),
+        };
+        let entries = pick_entries(&cli_servers, &file_servers);
+        if entries.is_empty() {
+            bail!("no servers configured");
+        }
+        let servers: Vec<Server> = entries.iter().map(|e| parse_entry(e)).collect();
+        return match pos[0].as_str() {
+            "attach" => attach(&servers, pos.get(1).context("attach needs a job id")?, &root).await,
+            _ => ps(&servers).await,
+        };
+    }
+    let (root, file) = found?;
     let text = std::fs::read_to_string(&file)?;
     let tasks = exfile::parse(&text)?;
-    let Some(name) = name else {
+    let Some(name) = pos.first() else {
         for t in &tasks {
             let mut marks = String::new();
             if t.replicas > 1 {
@@ -73,51 +100,100 @@ async fn run() -> Result<i32> {
         }
         return Ok(0);
     };
+    if pos.len() > 1 {
+        bail!("one task at a time");
+    }
     let mut task = tasks
         .into_iter()
-        .find(|t| t.name == name)
+        .find(|t| &t.name == name)
         .with_context(|| format!("no task '{name}' in {}", file.display()))?;
     task.live |= live_flag;
     if task.live && task.replicas > 1 {
         bail!("live workspace requires replicas = 1");
     }
+    if task.live && detach {
+        bail!("detach requires the sync workspace");
+    }
 
-    let entries = if !cli_servers.is_empty() {
-        cli_servers
-    } else if !task.servers.is_empty() {
-        task.servers.clone()
-    } else {
-        config_entries()
-    };
+    let entries = pick_entries(&cli_servers, &task.servers);
     if entries.is_empty() {
+        if detach {
+            bail!("detach needs a server");
+        }
         return run_local(&root, &task).await;
     }
     let servers: Vec<Server> = entries.iter().map(|e| parse_entry(e)).collect();
-
-    let mut picked = None;
+    let want = (task.replicas as usize).min(servers.len());
+    let mut picked: Vec<(TcpStream, Server)> = Vec::new();
     for s in &servers {
+        if picked.len() == want {
+            break;
+        }
         match TcpStream::connect(&s.addr).await {
-            Ok(c) => {
-                picked = Some((c, s));
-                break;
-            }
+            Ok(c) => picked.push((c, s.clone())),
             Err(e) => eprintln!("exzec: {} unreachable: {e}", s.addr),
         }
     }
-    let (conn, srv) = picked.context("no reachable server")?;
-    conn.set_nodelay(true)?;
-    let (mut r, mut w) = conn.into_split();
-    proto::send_msg(&mut w, &Msg::Hello { token: srv.token.clone(), task: task.clone() }).await?;
-
-    if task.live {
-        let tun = loop {
-            match proto::recv_msg(&mut r).await? {
-                Msg::TunnelReady { tunnel } => break tunnel,
-                Msg::Warn { msg } => eprintln!("exzec: server: {msg}"),
-                Msg::Err { msg } => bail!("{msg}"),
-                _ => bail!("unexpected reply"),
+    if picked.is_empty() {
+        bail!("no reachable server");
+    }
+    let scan = if task.live {
+        None
+    } else {
+        let root = root.clone();
+        Some(Arc::new(tokio::task::spawn_blocking(move || cas::scan(&root)).await??))
+    };
+    let k = picked.len() as u32;
+    let main = match k {
+        1 => "127.0.0.1".to_string(),
+        _ => picked[0].1.addr.split(':').next().unwrap_or("127.0.0.1").to_string(),
+    };
+    let mut sessions = Vec::new();
+    let mut rank0 = 0u32;
+    for (i, (conn, srv)) in picked.into_iter().enumerate() {
+        let ranks = task.replicas / k + u32::from((i as u32) < task.replicas % k);
+        let (task, root, main, scan) = (task.clone(), root.clone(), main.clone(), scan.clone());
+        sessions.push(tokio::spawn(session(conn, srv, root, task, rank0, ranks, main, scan, detach)));
+        rank0 += ranks;
+    }
+    let mut code = 0;
+    for s in sessions {
+        let c = match s.await? {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("exzec: {e:#}");
+                1
             }
         };
+        if code == 0 {
+            code = c;
+        }
+    }
+    Ok(code)
+}
+
+async fn session(
+    conn: TcpStream,
+    srv: Server,
+    root: PathBuf,
+    task: Task,
+    rank0: u32,
+    ranks: u32,
+    main: String,
+    scan: Option<Arc<Scan>>,
+    detach: bool,
+) -> Result<i32> {
+    conn.set_nodelay(true)?;
+    let (mut r, mut w) = conn.into_split();
+    let hello = Msg::Hello { token: srv.token.clone(), task: task.clone(), rank0, ranks, main, detach };
+    proto::send_msg(&mut w, &hello).await?;
+
+    if task.live {
+        let tun = wait_for(&mut r, |m| match m {
+            Msg::TunnelReady { tunnel } => Some(tunnel),
+            _ => None,
+        })
+        .await?;
         let nfsl = NFSTcpListener::bind("127.0.0.1:0", WorkspaceFs::new(root.clone())).await?;
         let nfs_port = nfsl.get_listen_port();
         tokio::spawn(async move {
@@ -129,19 +205,13 @@ async fn run() -> Result<i32> {
         let target: SocketAddr = format!("127.0.0.1:{nfs_port}").parse()?;
         tokio::spawn(proto::mux_dialer(t, target));
     } else {
-        let scan = {
-            let root = root.clone();
-            tokio::task::spawn_blocking(move || exzet::cas::scan(&root)).await??
-        };
-        proto::send_msg(&mut w, &Msg::Manifest { files: scan.files }).await?;
-        let need = loop {
-            match proto::recv_msg(&mut r).await? {
-                Msg::Need { hashes } => break hashes,
-                Msg::Warn { msg } => eprintln!("exzec: server: {msg}"),
-                Msg::Err { msg } => bail!("{msg}"),
-                _ => bail!("unexpected reply"),
-            }
-        };
+        let scan = scan.context("workspace scan missing")?;
+        proto::send_msg(&mut w, &Msg::Manifest { files: scan.files.clone() }).await?;
+        let need = wait_for(&mut r, |m| match m {
+            Msg::Need { hashes } => Some(hashes),
+            _ => None,
+        })
+        .await?;
         let n = need.len();
         for hash in need {
             let src = scan.by_hash.get(&hash).context("server requested an unknown blob")?;
@@ -150,34 +220,34 @@ async fn run() -> Result<i32> {
             proto::send_file(&mut w, src).await?;
         }
         if n > 0 {
-            eprintln!("exzec: uploaded {n} changed files");
+            eprintln!("exzec: uploaded {n} changed files to {}", srv.addr);
         }
     }
-
-    loop {
-        match proto::recv_msg(&mut r).await? {
-            Msg::Ready => break,
-            Msg::Warn { msg } => eprintln!("exzec: server: {msg}"),
-            Msg::Err { msg } => bail!("{msg}"),
-            _ => bail!("unexpected reply"),
-        }
+    if detach {
+        let job = wait_for(&mut r, |m| match m {
+            Msg::Started { job } => Some(job),
+            _ => None,
+        })
+        .await?;
+        eprintln!("exzec: job {job} on {}", srv.addr);
+        return Ok(0);
     }
-    eprintln!("exzec: running '{}' on {}", task.name, srv.addr);
+    wait_for(&mut r, |m| matches!(m, Msg::Ready).then_some(())).await?;
+    if ranks == task.replicas {
+        eprintln!("exzec: running '{}' on {}", task.name, srv.addr);
+    } else {
+        eprintln!("exzec: running '{}' ranks {rank0}-{} on {}", task.name, rank0 + ranks - 1, srv.addr);
+    }
+    watch_ctrlc(w);
+    stream_job(&mut r, &root, task.replicas).await
+}
 
-    tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
-        eprintln!("\nexzec: stopping remote job");
-        let _ = proto::send_msg(&mut w, &Msg::Kill).await;
-        let _ = tokio::signal::ctrl_c().await;
-        std::process::exit(130);
-    });
-
-    let world = task.replicas;
+async fn stream_job(r: &mut OwnedReadHalf, root: &Path, world: u32) -> Result<i32> {
     let mut lines: HashMap<(u32, bool), Vec<u8>> = HashMap::new();
     let mut pending_out: Option<(u32, bool)> = None;
     let mut pending_file: Option<(u64, u64, std::fs::File)> = None;
     loop {
-        match proto::recv(&mut r).await? {
+        match proto::recv(r).await? {
             Frame::Json(m) => match m {
                 Msg::Out { rank, err } => pending_out = Some((rank, err)),
                 Msg::OutFile { path, mode, len } => {
@@ -215,115 +285,103 @@ async fn run() -> Result<i32> {
     }
 }
 
-async fn run_local(root: &std::path::Path, task: &exfile::Task) -> Result<i32> {
-    use exzet::cell::{self, Limits};
-    if task.image.is_some() {
-        let usable = tokio::process::Command::new("docker")
-            .arg("version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !usable {
-            bail!("docker is not installed or not running");
-        }
-    }
-    let job = exzet::rand_hex(6);
-    let lim = Limits { cpus: task.cpus, mem_bytes: task.mem_bytes };
-    let world = task.replicas;
-    let pipe = world > 1;
-    let (otx, mut orx) = tokio::sync::mpsc::channel::<(u32, bool, Vec<u8>)>(16);
-    let (wtx, mut wrx) =
-        tokio::sync::mpsc::channel::<std::io::Result<std::process::ExitStatus>>(world as usize);
-    let mut handles = Vec::new();
-    for rank in 0..world {
-        let mut c = match &task.image {
-            Some(image) => cell::spawn_docker(
-                &job, rank, world, "127.0.0.1", &task.script, root, &lim, image, pipe,
-            )?,
-            None => cell::spawn(&job, rank, world, "127.0.0.1", &task.script, root, &lim, pipe)?,
-        };
-        if pipe {
-            let so = c.child.stdout.take().context("no stdout pipe")?;
-            let se = c.child.stderr.take().context("no stderr pipe")?;
-            tokio::spawn(cell::pump_output(so, rank, false, otx.clone()));
-            tokio::spawn(cell::pump_output(se, rank, true, otx.clone()));
-        }
-        handles.push(c.handle.clone());
-        let wtx = wtx.clone();
-        let mut child = c.child;
-        tokio::spawn(async move {
-            let _ = wtx.send(child.wait().await).await;
-        });
-    }
-    drop(otx);
-    drop(wtx);
-
-    let deadline = task
-        .time_secs
-        .map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s));
-    let mut lines: HashMap<(u32, bool), Vec<u8>> = HashMap::new();
-    let total = world as usize;
-    let mut exited = 0usize;
-    let mut code = 0i32;
-    let mut pumps_open = pipe;
-    let mut killed = false;
-    let mut timed_out = false;
-    let mut interrupted = false;
-    while exited < total {
-        tokio::select! {
-            out = orx.recv(), if pumps_open => match out {
-                Some((rank, err, data)) => emit(world, rank, err, &data, &mut lines),
-                None => pumps_open = false,
-            },
-            st = wrx.recv() => if let Some(st) = st {
-                exited += 1;
-                let c = cell::exit_code(st?);
-                if code == 0 {
-                    code = c;
-                }
-            },
-            _ = tokio::signal::ctrl_c(), if !killed => {
-                killed = true;
-                interrupted = true;
-                for h in &handles {
-                    cell::kill_tree(h);
-                }
-            },
-            _ = tokio::time::sleep_until(deadline.unwrap_or_else(cell::far_future)), if deadline.is_some() && !killed => {
-                killed = true;
-                timed_out = true;
-                for h in &handles {
-                    cell::kill_tree(h);
-                }
-            },
-        }
-    }
-    while let Ok(Some((rank, err, data))) =
-        tokio::time::timeout(std::time::Duration::from_millis(400), orx.recv()).await
-    {
-        emit(world, rank, err, &data, &mut lines);
-    }
-    flush_lines(&mut lines);
-    for h in &handles {
-        cell::remove_cgroup(h);
-    }
-    if timed_out {
-        code = 124;
-    }
-    if interrupted {
-        code = 130;
-    }
-    Ok(code)
+async fn open(s: &Server, first: &Msg) -> Result<(OwnedReadHalf, OwnedWriteHalf)> {
+    let conn = TcpStream::connect(&s.addr).await?;
+    conn.set_nodelay(true)?;
+    let (r, mut w) = conn.into_split();
+    proto::send_msg(&mut w, first).await?;
+    Ok((r, w))
 }
 
-fn norm_addr(a: String) -> String {
-    if a.contains(':') {
-        a
+async fn attach(servers: &[Server], job: &str, root: &Path) -> Result<i32> {
+    for s in servers {
+        let first = Msg::Attach { token: s.token.clone(), job: job.to_string() };
+        let Ok((mut r, w)) = open(s, &first).await else {
+            continue;
+        };
+        match proto::recv_msg(&mut r).await? {
+            Msg::Attached { world } => {
+                watch_ctrlc(w);
+                return stream_job(&mut r, root, world).await;
+            }
+            Msg::Err { msg } => eprintln!("exzec: {}: {msg}", s.addr),
+            _ => bail!("unexpected reply"),
+        }
+    }
+    bail!("job '{job}' not found on any reachable server")
+}
+
+async fn ps(servers: &[Server]) -> Result<i32> {
+    for s in servers {
+        let (mut r, _w) = match open(s, &Msg::Ps { token: s.token.clone() }).await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("exzec: {} unreachable: {e}", s.addr);
+                continue;
+            }
+        };
+        let jobs = wait_for(&mut r, |m| match m {
+            Msg::Jobs { jobs } => Some(jobs),
+            _ => None,
+        })
+        .await?;
+        for j in jobs {
+            let st = j.code.map_or("running".to_string(), |c| format!("exit {c}"));
+            println!("{}  {:<20} {:<10} {}", j.job, j.name, st, s.addr);
+        }
+    }
+    Ok(0)
+}
+
+async fn run_local(root: &Path, task: &Task) -> Result<i32> {
+    if task.image.is_some() && !cell::docker_ready().await {
+        bail!("docker is not installed or not running");
+    }
+    let job = exzet::rand_hex(6);
+    let world = task.replicas;
+    let (otx, mut orx) = tokio::sync::mpsc::channel::<cell::Chunk>(16);
+    let j = cell::Job { task, id: &job, dir: root, rank0: 0, ranks: world, main: "127.0.0.1", pipe: world > 1 };
+    let printer = async {
+        let mut lines = HashMap::new();
+        while let Some((rank, err, data)) = orx.recv().await {
+            emit(world, rank, err, &data, &mut lines);
+        }
+        flush_lines(&mut lines);
+    };
+    let kill = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    let (res, _) = tokio::join!(cell::run(j, otx, kill), printer);
+    Ok(res?.0)
+}
+
+fn watch_ctrlc(mut w: OwnedWriteHalf) {
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        eprintln!("\nexzec: stopping remote job");
+        let _ = proto::send_msg(&mut w, &Msg::Kill).await;
+        let _ = tokio::signal::ctrl_c().await;
+        std::process::exit(130);
+    });
+}
+
+async fn wait_for<T>(r: &mut OwnedReadHalf, f: impl Fn(Msg) -> Option<T>) -> Result<T> {
+    loop {
+        match proto::recv_msg(r).await? {
+            Msg::Warn { msg } => eprintln!("exzec: server: {msg}"),
+            Msg::Err { msg } => bail!("{msg}"),
+            m => return f(m).context("unexpected reply"),
+        }
+    }
+}
+
+fn pick_entries(cli: &[String], task: &[String]) -> Vec<String> {
+    if !cli.is_empty() {
+        cli.to_vec()
+    } else if !task.is_empty() {
+        task.to_vec()
     } else {
-        format!("{a}:{}", exzet::DEFAULT_PORT)
+        config_entries()
     }
 }
 
@@ -332,7 +390,8 @@ fn parse_entry(e: &str) -> Server {
         Some((t, a)) => (t.to_string(), a.to_string()),
         None => (String::new(), e.to_string()),
     };
-    Server { addr: norm_addr(addr), token }
+    let addr = if addr.contains(':') { addr } else { format!("{addr}:{}", exzet::DEFAULT_PORT) };
+    Server { addr, token }
 }
 
 fn config_entries() -> Vec<String> {

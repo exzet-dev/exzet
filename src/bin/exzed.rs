@@ -1,19 +1,26 @@
 use anyhow::{bail, Context, Result};
 use exzet::cas::{self, Store};
-use exzet::cell::{self, Limits};
+use exzet::cell;
 use exzet::exfile::Task;
-use exzet::proto::{self, Msg};
+use exzet::proto::{self, JobInfo, Msg};
 use exzet::rand_hex;
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex};
+
+struct JobEntry {
+    name: String,
+    world: u32,
+    code: Option<i32>,
+    kill: mpsc::Sender<()>,
+}
 
 struct Daemon {
     token: String,
@@ -21,6 +28,7 @@ struct Daemon {
     store: Store,
     containers: bool,
     tunnels: Mutex<HashMap<String, oneshot::Sender<TcpStream>>>,
+    jobs: Mutex<HashMap<String, JobEntry>>,
 }
 
 #[tokio::main]
@@ -77,6 +85,7 @@ async fn main() -> Result<()> {
         store,
         containers,
         tunnels: Mutex::new(HashMap::new()),
+        jobs: Mutex::new(HashMap::new()),
     });
     let l = TcpListener::bind(&listen)
         .await
@@ -174,11 +183,18 @@ fn load_or_make_token(state: &Path) -> Result<String> {
 async fn handle(d: Arc<Daemon>, conn: TcpStream) -> Result<()> {
     conn.set_nodelay(true)?;
     let (mut r, mut w) = conn.into_split();
-    match proto::recv_msg(&mut r).await? {
-        Msg::TunnelJoin { token, tunnel } => {
-            if !proto::token_eq(&token, &d.token) {
-                bail!("bad token");
-            }
+    let msg = proto::recv_msg(&mut r).await?;
+    let token = match &msg {
+        Msg::Hello { token, .. } | Msg::TunnelJoin { token, .. } | Msg::Ps { token } | Msg::Attach { token, .. } => token,
+        _ => bail!("unexpected first message"),
+    };
+    if !proto::token_eq(token, &d.token) {
+        let _ = proto::send_msg(&mut w, &Msg::Err { msg: "bad token".into() }).await;
+        drain(r).await;
+        bail!("bad token");
+    }
+    match msg {
+        Msg::TunnelJoin { tunnel, .. } => {
             let tx = d
                 .tunnels
                 .lock()
@@ -188,22 +204,27 @@ async fn handle(d: Arc<Daemon>, conn: TcpStream) -> Result<()> {
             let _ = tx.send(r.reunite(w)?);
             Ok(())
         }
-        Msg::Hello { token, task } => {
-            if !proto::token_eq(&token, &d.token) {
-                let _ = proto::send_msg(&mut w, &Msg::Err { msg: "bad token".into() }).await;
-                drain(r).await;
-                bail!("bad token");
-            }
-            let name = task.name.clone();
-            match run_job(&d, r, &mut w, task).await {
-                Ok(code) => {
-                    eprintln!("exzed: task '{name}' exited {code}");
-                    Ok(())
-                }
-                Err(e) => Err(e),
-            }
+        Msg::Ps { .. } => {
+            let mut jobs: Vec<JobInfo> = d
+                .jobs
+                .lock()
+                .await
+                .iter()
+                .map(|(k, e)| JobInfo { job: k.clone(), name: e.name.clone(), code: e.code })
+                .collect();
+            jobs.sort_by(|a, b| a.job.cmp(&b.job));
+            proto::send_msg(&mut w, &Msg::Jobs { jobs }).await
         }
-        _ => bail!("unexpected first message"),
+        Msg::Attach { job, .. } => attach_job(d, r, w, job).await,
+        Msg::Hello { task, rank0, ranks, main, detach, .. } => {
+            let name = task.name.clone();
+            let code = run_job(&d, r, &mut w, task, rank0, ranks, main, detach).await?;
+            if !detach {
+                eprintln!("exzed: task '{name}' exited {code}");
+            }
+            Ok(())
+        }
+        _ => unreachable!(),
     }
 }
 
@@ -223,25 +244,72 @@ async fn run_job(
     r: OwnedReadHalf,
     w: &mut OwnedWriteHalf,
     task: Task,
+    rank0: u32,
+    ranks: u32,
+    main: String,
+    detach: bool,
 ) -> Result<i32> {
-    if task.live && task.replicas > 1 {
-        bail!("live workspace requires replicas = 1");
-    }
     let job = rand_hex(6);
     let jobdir = d.state.join("jobs").join(&job);
     let work = jobdir.join("work");
-    std::fs::create_dir_all(&work)?;
     let mut mounted = false;
 
     let mut ro = Some(r);
-    let res = job_inner(d, &mut ro, w, &task, &job, &work, &mut mounted).await;
+    let res = prepare(d, &mut ro, w, &task, rank0, ranks, detach, &work, &mut mounted).await;
     if let Err(e) = &res {
         let _ = proto::send_msg(w, &Msg::Err { msg: format!("{e:#}") }).await;
         if let Some(r) = ro.take() {
             drain(r).await;
         }
+        let _ = std::fs::remove_dir_all(&jobdir);
+        return res.map(|_| 0);
     }
 
+    if detach {
+        let (ktx, mut krx) = mpsc::channel::<()>(1);
+        let entry = JobEntry { name: task.name.clone(), world: task.replicas, code: None, kill: ktx };
+        d.jobs.lock().await.insert(job.clone(), entry);
+        proto::send_msg(w, &Msg::Started { job: job.clone() }).await?;
+        let d = d.clone();
+        tokio::spawn(async move {
+            let kill = async {
+                let _ = krx.recv().await;
+            };
+            let code = match tokio::fs::File::create(jobdir.join("log")).await {
+                Ok(mut log) => run_task(&mut log, &task, rank0, ranks, &main, &job, &work, kill)
+                    .await
+                    .unwrap_or(1),
+                Err(_) => 1,
+            };
+            if let Some(e) = d.jobs.lock().await.get_mut(&job) {
+                e.code = Some(code);
+            }
+            let _ = std::fs::remove_dir_all(&work);
+            eprintln!("exzed: job {job} ('{}') exited {code}", task.name);
+        });
+        return Ok(0);
+    }
+
+    let (ktx, krx) = oneshot::channel::<()>();
+    let mut cr = ro.take().context("connection consumed")?;
+    tokio::spawn(async move {
+        loop {
+            match proto::recv_msg(&mut cr).await {
+                Ok(Msg::Kill) | Err(_) => {
+                    let _ = ktx.send(());
+                    break;
+                }
+                Ok(_) => {}
+            }
+        }
+    });
+    let kill = async {
+        let _ = krx.await;
+    };
+    let res = run_task(w, &task, rank0, ranks, &main, &job, &work, kill).await;
+    if let Err(e) = &res {
+        let _ = proto::send_msg(w, &Msg::Err { msg: format!("{e:#}") }).await;
+    }
     if mounted {
         let _ = rustix::mount::unmount(&work, rustix::mount::UnmountFlags::DETACH);
     }
@@ -249,28 +317,32 @@ async fn run_job(
     res
 }
 
-async fn job_inner(
+async fn prepare(
     d: &Arc<Daemon>,
     ro: &mut Option<OwnedReadHalf>,
     w: &mut OwnedWriteHalf,
     task: &Task,
-    job: &str,
+    rank0: u32,
+    ranks: u32,
+    detach: bool,
     work: &Path,
     mounted: &mut bool,
-) -> Result<i32> {
+) -> Result<()> {
+    if ranks == 0 || rank0.checked_add(ranks).is_none_or(|e| e > task.replicas) {
+        bail!("bad rank range");
+    }
+    if task.live && task.replicas > 1 {
+        bail!("live workspace requires replicas = 1");
+    }
+    if task.live && detach {
+        bail!("detach requires the sync workspace");
+    }
+    std::fs::create_dir_all(work)?;
     if let Some(image) = &task.image {
         if !d.containers {
             bail!("containers: false on this server");
         }
-        let usable = tokio::process::Command::new("docker")
-            .arg("version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !usable {
+        if !cell::docker_ready().await {
             bail!("docker is not installed or not running on this server");
         }
         let cached = tokio::process::Command::new("docker")
@@ -378,94 +450,28 @@ async fn job_inner(
         let work2 = work.to_path_buf();
         tokio::task::spawn_blocking(move || d2.store.hydrate(&files2, &work2)).await??;
     }
-    proto::send_msg(w, &Msg::Ready).await?;
-
-    let lim = Limits { cpus: task.cpus, mem_bytes: task.mem_bytes };
-    let (otx, mut orx) = mpsc::channel::<(u32, bool, Vec<u8>)>(16);
-    let (wtx, mut wrx) = mpsc::channel::<std::io::Result<ExitStatus>>(task.replicas as usize);
-    let mut running: Vec<cell::Handle> = Vec::new();
-    for rank in 0..task.replicas {
-        let mut c = match &task.image {
-            Some(image) => cell::spawn_docker(
-                job, rank, task.replicas, "127.0.0.1", &task.script, work, &lim, image, true,
-            )?,
-            None => {
-                cell::spawn(job, rank, task.replicas, "127.0.0.1", &task.script, work, &lim, true)?
-            }
-        };
-        let so = c.child.stdout.take().context("no stdout pipe")?;
-        let se = c.child.stderr.take().context("no stderr pipe")?;
-        tokio::spawn(cell::pump_output(so, rank, false, otx.clone()));
-        tokio::spawn(cell::pump_output(se, rank, true, otx.clone()));
-        running.push(c.handle.clone());
-        let wtx = wtx.clone();
-        let mut child = c.child;
-        tokio::spawn(async move {
-            let _ = wtx.send(child.wait().await).await;
-        });
+    if !detach {
+        proto::send_msg(w, &Msg::Ready).await?;
     }
-    drop(otx);
-    drop(wtx);
+    Ok(())
+}
 
-    let (ktx, mut krx) = oneshot::channel::<()>();
-    let mut r = ro.take().context("connection consumed")?;
-    tokio::spawn(async move {
-        loop {
-            match proto::recv_msg(&mut r).await {
-                Ok(Msg::Kill) | Err(_) => {
-                    let _ = ktx.send(());
-                    break;
-                }
-                Ok(_) => {}
-            }
-        }
-    });
-
-    let deadline = task
-        .time_secs
-        .map(|s| tokio::time::Instant::now() + Duration::from_secs(s));
-    let total = task.replicas as usize;
-    let mut exited = 0usize;
-    let mut code = 0i32;
-    let mut pumps_open = true;
-    let mut killed = false;
-    let mut timed_out = false;
-    let mut client_kill = false;
-    while exited < total {
-        tokio::select! {
-            out = orx.recv(), if pumps_open => match out {
-                Some((rank, err, data)) => {
-                    proto::send_msg(w, &Msg::Out { rank, err }).await?;
-                    proto::send_raw(w, &data).await?;
-                }
-                None => pumps_open = false,
-            },
-            st = wrx.recv() => if let Some(st) = st {
-                exited += 1;
-                let c = cell::exit_code(st?);
-                if code == 0 {
-                    code = c;
-                }
-            },
-            _ = &mut krx, if !killed => {
-                killed = true;
-                client_kill = true;
-                kill_all(&running);
-            },
-            _ = tokio::time::sleep_until(deadline.unwrap_or_else(cell::far_future)), if deadline.is_some() && !killed => {
-                killed = true;
-                timed_out = true;
-                kill_all(&running);
-            },
-        }
-    }
-    while let Ok(Some((rank, err, data))) =
-        tokio::time::timeout(Duration::from_millis(400), orx.recv()).await
-    {
-        proto::send_msg(w, &Msg::Out { rank, err }).await?;
-        proto::send_raw(w, &data).await?;
-    }
-    if !task.live && !client_kill && !task.outputs.is_empty() {
+async fn run_task<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    task: &Task,
+    rank0: u32,
+    ranks: u32,
+    main: &str,
+    job: &str,
+    work: &Path,
+    kill: impl std::future::Future<Output = ()>,
+) -> Result<i32> {
+    let (otx, orx) = mpsc::channel(16);
+    let j = cell::Job { task, id: job, dir: work, rank0, ranks, main, pipe: true };
+    let (run, fwd) = tokio::join!(cell::run(j, otx, kill), forward(orx, w));
+    fwd?;
+    let (code, interrupted) = run?;
+    if rank0 == 0 && !task.live && !interrupted && !task.outputs.is_empty() {
         let (outs, unmatched) = collect_outputs(work, &task.outputs)?;
         for spec in unmatched {
             proto::send_msg(w, &Msg::Warn { msg: format!("output '{spec}' matched nothing") }).await?;
@@ -481,22 +487,65 @@ async fn job_inner(
             proto::send_file(w, &abs).await?;
         }
     }
-    if timed_out {
-        code = 124;
-    }
-    if client_kill {
-        code = 130;
-    }
     proto::send_msg(w, &Msg::Exit { code }).await?;
-    for h in &running {
-        cell::remove_cgroup(h);
-    }
     Ok(code)
 }
 
-fn kill_all(running: &[cell::Handle]) {
-    for h in running {
-        cell::kill_tree(h);
+async fn forward<W: AsyncWrite + Unpin>(mut orx: mpsc::Receiver<cell::Chunk>, w: &mut W) -> Result<()> {
+    let mut res = Ok(());
+    while let Some((rank, err, data)) = orx.recv().await {
+        if res.is_err() {
+            continue;
+        }
+        if let Err(e) = proto::send_msg(w, &Msg::Out { rank, err }).await {
+            res = Err(e);
+        } else if let Err(e) = proto::send_raw(w, &data).await {
+            res = Err(e);
+        }
+    }
+    res
+}
+
+async fn attach_job(d: Arc<Daemon>, mut r: OwnedReadHalf, mut w: OwnedWriteHalf, job: String) -> Result<()> {
+    let world = match d.jobs.lock().await.get(&job) {
+        Some(e) => e.world,
+        None => {
+            let _ = proto::send_msg(&mut w, &Msg::Err { msg: format!("unknown job '{job}'") }).await;
+            bail!("unknown job '{job}'");
+        }
+    };
+    proto::send_msg(&mut w, &Msg::Attached { world }).await?;
+    let (d2, job2) = (d.clone(), job.clone());
+    tokio::spawn(async move {
+        loop {
+            match proto::recv_msg(&mut r).await {
+                Ok(Msg::Kill) => {
+                    if let Some(e) = d2.jobs.lock().await.get(&job2) {
+                        let _ = e.kill.try_send(());
+                    }
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+    let mut f = tokio::fs::File::open(d.state.join("jobs").join(&job).join("log")).await?;
+    let mut buf = vec![0u8; 64 << 10];
+    let mut done = false;
+    loop {
+        let n = f.read(&mut buf).await?;
+        if n > 0 {
+            w.write_all(&buf[..n]).await?;
+            continue;
+        }
+        if done {
+            return Ok(());
+        }
+        done = d.jobs.lock().await.get(&job).is_none_or(|e| e.code.is_some());
+        if !done {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
     }
 }
 

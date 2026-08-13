@@ -171,32 +171,22 @@ fn num(v: &str, n: usize) -> Result<u32> {
 }
 
 fn size(v: &str, n: usize) -> Result<u64> {
-    let s = v.trim().to_ascii_lowercase();
-    let (digits, mult) = match s.chars().last() {
-        Some('k') => (&s[..s.len() - 1], 1u64 << 10),
-        Some('m') => (&s[..s.len() - 1], 1 << 20),
-        Some('g') => (&s[..s.len() - 1], 1 << 30),
-        Some('t') => (&s[..s.len() - 1], 1 << 40),
-        _ => (s.as_str(), 1),
-    };
-    let base: u64 = digits
-        .parse()
-        .with_context(|| format!("line {n}: expected a size like 64g, got '{v}'"))?;
-    Ok(base * mult)
+    scaled(v, n, &[('k', 1 << 10), ('m', 1 << 20), ('g', 1 << 30), ('t', 1 << 40)], "64g")
 }
 
 fn dur(v: &str, n: usize) -> Result<u64> {
+    scaled(v, n, &[('s', 1), ('m', 60), ('h', 3600), ('d', 86400)], "12h")
+}
+
+fn scaled(v: &str, n: usize, units: &[(char, u64)], like: &str) -> Result<u64> {
     let s = v.trim().to_ascii_lowercase();
-    let (digits, mult) = match s.chars().last() {
-        Some('s') => (&s[..s.len() - 1], 1u64),
-        Some('m') => (&s[..s.len() - 1], 60),
-        Some('h') => (&s[..s.len() - 1], 3600),
-        Some('d') => (&s[..s.len() - 1], 86400),
-        _ => (s.as_str(), 1),
+    let (digits, mult) = match s.chars().last().and_then(|c| units.iter().find(|(u, _)| *u == c)) {
+        Some(&(_, m)) => (&s[..s.len() - 1], m),
+        None => (s.as_str(), 1),
     };
     let base: u64 = digits
         .parse()
-        .with_context(|| format!("line {n}: expected a duration like 12h, got '{v}'"))?;
+        .with_context(|| format!("line {n}: expected a value like {like}, got '{v}'"))?;
     Ok(base * mult)
 }
 

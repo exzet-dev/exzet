@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, Mutex};
 pub const CHUNK: usize = 1 << 20;
 const MAX_FRAME: usize = CHUNK + 64;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileEntry {
     pub path: String,
     pub mode: u32,
@@ -22,14 +22,26 @@ pub struct FileEntry {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct JobInfo {
+    pub job: String,
+    pub name: String,
+    pub code: Option<i32>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub enum Msg {
-    Hello { token: String, task: Task },
+    Hello { token: String, task: Task, rank0: u32, ranks: u32, main: String, detach: bool },
     TunnelJoin { token: String, tunnel: String },
+    Ps { token: String },
+    Attach { token: String, job: String },
     Manifest { files: Vec<FileEntry> },
     Need { hashes: Vec<String> },
     Blob { hash: String, len: u64 },
     TunnelReady { tunnel: String },
     Ready,
+    Started { job: String },
+    Attached { world: u32 },
+    Jobs { jobs: Vec<JobInfo> },
     Out { rank: u32, err: bool },
     OutFile { path: String, mode: u32, len: u64 },
     Exit { code: i32 },
@@ -43,21 +55,20 @@ pub enum Frame {
     Raw(Vec<u8>),
 }
 
-pub async fn send_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &Msg) -> Result<()> {
-    let body = serde_json::to_vec(msg)?;
+async fn send_frame<W: AsyncWrite + Unpin>(w: &mut W, tag: u8, body: &[u8]) -> Result<()> {
     w.write_u32((body.len() + 1) as u32).await?;
-    w.write_u8(b'J').await?;
-    w.write_all(&body).await?;
+    w.write_u8(tag).await?;
+    w.write_all(body).await?;
     w.flush().await?;
     Ok(())
 }
 
+pub async fn send_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &Msg) -> Result<()> {
+    send_frame(w, b'J', &serde_json::to_vec(msg)?).await
+}
+
 pub async fn send_raw<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> Result<()> {
-    w.write_u32((bytes.len() + 1) as u32).await?;
-    w.write_u8(b'R').await?;
-    w.write_all(bytes).await?;
-    w.flush().await?;
-    Ok(())
+    send_frame(w, b'R', bytes).await
 }
 
 pub async fn recv<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame> {

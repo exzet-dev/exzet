@@ -38,6 +38,9 @@ First reachable wins. No servers: runs locally.
 exzec # list tasks
 exzec release
 exzec -f ./exfile release # same same, working dir is rel to exfile
+exzec -d release # print job id then run in background
+exzec ps # jobs on your servers
+exzec attach <job> # replay + follow output, ctrl-c kills it
 ```
 
  - Workspace is hashed and `.gitignore` works
@@ -62,22 +65,31 @@ exzec -f ./exfile release # same same, working dir is rel to exfile
 | `replicas` | `4` | parallel copies |
 | `workspace` | `live` | `sync` default |
 | `outputs` | `target/release/exzec` | copied back after run |
-| `gpus`, `disk` | `1`, `100g` | TODO |
+| `gpus` | `1` | docker only, passed as `--gpus` |
+| `disk` | `100g` | TODO |
 
 ### replicas
 
-`replicas: N` runs N copies of the script concurrently all on the one server that takes the job (or all locally) in a shared workspace.
+`replicas: N` runs N copies of the script concurrently, spread across every reachable server in `servers` (or all locally).
 You can use these env variables (set per process) in order to split up work among replicas:
 - `EXZET_RANK` (0..N-1)
 - `EXZET_WORLD` (N)
 - `EXZET_JOB` (id shared by the whole run)
-- `EXZET_MAIN` (address of rank 0's host, for rendezvous)
+- `EXZET_MAIN` (address of the server hosting rank 0, for rendezvous)
 
 Output is line-buffered and each line prefixed `[rank]`. 
 `cpus`/`mem` apply per rank, not per job. 
 Exit code is 0 only if every rank exits 0, else the first nonzero.
-Ranks share the working directory.
+Ranks share a working directory per server, synced separately.
+`outputs` come back from the rank 0 server only.
 It's your scripts job to split work, exzet just gives you the ability to do that.
+
+### detach
+
+`exzec -d <task>` hands the job to the server and exits with its id; the job outlives your connection, laptop, everything.
+Output spools on the server. `exzec attach <id>` replays it, follows live, delivers `outputs`, and returns the exit code; ctrl-c while attached kills the job.
+With multiple servers you get one job id per server.
+Needs a server and the sync workspace. Job list resets when exzed restarts.
 
 ### live
 

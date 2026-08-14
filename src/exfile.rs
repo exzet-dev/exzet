@@ -130,6 +130,9 @@ fn finish_task(tasks: &mut Vec<Task>, mut t: Task, lines: &[String], hn: usize) 
     if t.live && t.replicas > 1 {
         bail!("task '{}': live workspace requires replicas = 1", t.name);
     }
+    if t.gpus > 0 && t.image.is_none() {
+        bail!("task '{}': gpus requires an image", t.name);
+    }
     if tasks.iter().any(|e| e.name == t.name) {
         bail!("task '{}' defined twice", t.name);
     }
@@ -204,6 +207,7 @@ fn valid_name(s: &str) -> bool {
     let mut chars = s.chars();
     matches!(chars.next(), Some(c) if c.is_ascii_alphabetic())
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && !matches!(s, "ps" | "attach")
 }
 
 fn dedent(lines: &[String]) -> String {

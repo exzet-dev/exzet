@@ -65,6 +65,18 @@ impl WorkspaceFs {
         }
     }
 
+    async fn newnode(
+        &self,
+        dirid: fileid3,
+        name: &filename3,
+        mk: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        let path = self.path_of(dirid)?.join(osname(name)?);
+        mk(&path).map_err(nerr)?;
+        let id = self.id_for(path);
+        Ok((id, self.getattr(id).await?))
+    }
+
     fn move_prefix(&self, from: &Path, to: &Path) {
         let mut ids = self.ids.lock().unwrap();
         let moved: Vec<PathBuf> = ids
@@ -92,8 +104,12 @@ fn nerr(e: io::Error) -> nfsstat3 {
     }
 }
 
-fn osname(n: &filename3) -> &OsStr {
-    OsStr::from_bytes(n.as_ref())
+fn osname(n: &filename3) -> Result<&OsStr, nfsstat3> {
+    match n.as_ref() as &[u8] {
+        b"" | b".." => Err(nfsstat3::NFS3ERR_ACCES),
+        b if b.contains(&b'/') => Err(nfsstat3::NFS3ERR_ACCES),
+        b => Ok(OsStr::from_bytes(b)),
+    }
 }
 
 #[async_trait]
@@ -108,11 +124,11 @@ impl NFSFileSystem for WorkspaceFs {
 
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsstat3> {
         let dir = self.path_of(dirid)?;
-        let name = osname(filename);
-        if name == "." {
+        let name: &[u8] = filename.as_ref();
+        if name == b"." {
             return Ok(dirid);
         }
-        if name == ".." {
+        if name == b".." {
             let parent = if dir == self.root {
                 self.root.clone()
             } else {
@@ -120,14 +136,19 @@ impl NFSFileSystem for WorkspaceFs {
             };
             return Ok(self.id_for(parent));
         }
-        let path = dir.join(name);
+        let path = dir.join(osname(filename)?);
         path.symlink_metadata().map_err(nerr)?;
         Ok(self.id_for(path))
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
         let path = self.path_of(id)?;
-        let meta = path.symlink_metadata().map_err(nerr)?;
+        let meta = path.symlink_metadata().map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                self.forget(&path);
+            }
+            nerr(e)
+        })?;
         Ok(metadata_to_fattr3(id, &meta))
     }
 
@@ -172,10 +193,8 @@ impl NFSFileSystem for WorkspaceFs {
         filename: &filename3,
         attr: sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        let path = self.path_of(dirid)?.join(osname(filename));
-        fs::File::create(&path).map_err(nerr)?;
-        path_setattr(&path, &attr).await?;
-        let id = self.id_for(path);
+        let (id, _) = self.newnode(dirid, filename, |p| fs::File::create(p).map(drop)).await?;
+        path_setattr(&self.path_of(id)?, &attr).await?;
         Ok((id, self.getattr(id).await?))
     }
 
@@ -184,13 +203,8 @@ impl NFSFileSystem for WorkspaceFs {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
-        let path = self.path_of(dirid)?.join(osname(filename));
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(nerr)?;
-        Ok(self.id_for(path))
+        let mk = |p: &Path| fs::OpenOptions::new().write(true).create_new(true).open(p).map(drop);
+        Ok(self.newnode(dirid, filename, mk).await?.0)
     }
 
     async fn mkdir(
@@ -198,14 +212,11 @@ impl NFSFileSystem for WorkspaceFs {
         dirid: fileid3,
         dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        let path = self.path_of(dirid)?.join(osname(dirname));
-        fs::create_dir(&path).map_err(nerr)?;
-        let id = self.id_for(path);
-        Ok((id, self.getattr(id).await?))
+        self.newnode(dirid, dirname, |p| fs::create_dir(p)).await
     }
 
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
-        let path = self.path_of(dirid)?.join(osname(filename));
+        let path = self.path_of(dirid)?.join(osname(filename)?);
         let meta = path.symlink_metadata().map_err(nerr)?;
         if meta.is_dir() {
             fs::remove_dir(&path).map_err(nerr)?;
@@ -223,8 +234,8 @@ impl NFSFileSystem for WorkspaceFs {
         to_dirid: fileid3,
         to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
-        let from = self.path_of(from_dirid)?.join(osname(from_filename));
-        let to = self.path_of(to_dirid)?.join(osname(to_filename));
+        let from = self.path_of(from_dirid)?.join(osname(from_filename)?);
+        let to = self.path_of(to_dirid)?.join(osname(to_filename)?);
         fs::rename(&from, &to).map_err(nerr)?;
         self.forget(&to);
         self.move_prefix(&from, &to);
@@ -285,10 +296,8 @@ impl NFSFileSystem for WorkspaceFs {
         symlink: &nfspath3,
         _attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        let path = self.path_of(dirid)?.join(osname(linkname));
-        std::os::unix::fs::symlink(OsStr::from_bytes(symlink.as_ref()), &path).map_err(nerr)?;
-        let id = self.id_for(path);
-        Ok((id, self.getattr(id).await?))
+        let target = OsStr::from_bytes(symlink.as_ref());
+        self.newnode(dirid, linkname, |p| std::os::unix::fs::symlink(target, p)).await
     }
 
     async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {

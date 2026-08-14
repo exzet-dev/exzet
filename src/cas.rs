@@ -32,14 +32,8 @@ pub struct Scan {
 pub fn scan(root: &Path) -> Result<Scan> {
     let mut files = Vec::new();
     let mut by_hash = HashMap::new();
-    let walker = ignore::WalkBuilder::new(root)
-        .hidden(false)
-        .git_ignore(true)
-        .git_global(false)
-        .git_exclude(true)
-        .require_git(false)
-        .filter_entry(|e| e.file_name() != ".git")
-        .build();
+    let walker = ignore::WalkBuilder::new(root).hidden(false).git_ignore(true).git_global(false)
+        .git_exclude(true).require_git(false).filter_entry(|e| e.file_name() != ".git").build();
     for entry in walker {
         let entry = entry?;
         let path = entry.path();

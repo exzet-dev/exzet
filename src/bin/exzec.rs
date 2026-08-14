@@ -65,12 +65,13 @@ async fn run() -> Result<i32> {
     if matches!(pos.first().map(String::as_str), Some("ps") | Some("attach")) {
         let (root, file_servers) = match &found {
             Ok((root, file)) => {
-                let servers = std::fs::read_to_string(file)
-                    .ok()
-                    .and_then(|t| exfile::parse(&t).ok())
-                    .and_then(|ts| ts.into_iter().next().map(|t| t.servers))
-                    .unwrap_or_default();
-                (root.clone(), servers)
+                let mut v: Vec<String> = Vec::new();
+                for s in exfile::parse(&std::fs::read_to_string(file)?)?.into_iter().flat_map(|t| t.servers) {
+                    if !v.contains(&s) {
+                        v.push(s);
+                    }
+                }
+                (root.clone(), v)
             }
             Err(_) => (std::env::current_dir()?, Vec::new()),
         };
@@ -89,14 +90,9 @@ async fn run() -> Result<i32> {
     let tasks = exfile::parse(&text)?;
     let Some(name) = pos.first() else {
         for t in &tasks {
-            let mut marks = String::new();
-            if t.replicas > 1 {
-                marks.push_str(&format!(" x{}", t.replicas));
-            }
-            if t.live {
-                marks.push_str(" (live)");
-            }
-            println!("{:<20} {}{}", t.name, t.script.lines().next().unwrap_or(""), marks);
+            let x = if t.replicas > 1 { format!(" x{}", t.replicas) } else { String::new() };
+            let live = if t.live { " (live)" } else { "" };
+            println!("{:<20} {}{}{}", t.name, t.script.lines().next().unwrap_or(""), x, live);
         }
         return Ok(0);
     };
@@ -146,7 +142,7 @@ async fn run() -> Result<i32> {
     let k = picked.len() as u32;
     let main = match k {
         1 => "127.0.0.1".to_string(),
-        _ => picked[0].1.addr.split(':').next().unwrap_or("127.0.0.1").to_string(),
+        _ => picked[0].1.addr.rsplit_once(':').map_or("127.0.0.1", |(h, _)| h.trim_matches(&['[', ']'][..])).to_string(),
     };
     let mut sessions = Vec::new();
     let mut rank0 = 0u32;
@@ -189,11 +185,7 @@ async fn session(
     proto::send_msg(&mut w, &hello).await?;
 
     if task.live {
-        let tun = wait_for(&mut r, |m| match m {
-            Msg::TunnelReady { tunnel } => Some(tunnel),
-            _ => None,
-        })
-        .await?;
+        let tun = wait_for(&mut r, |m| if let Msg::TunnelReady { tunnel } = m { Some(tunnel) } else { None }).await?;
         let nfsl = NFSTcpListener::bind("127.0.0.1:0", WorkspaceFs::new(root.clone())).await?;
         let nfs_port = nfsl.get_listen_port();
         tokio::spawn(async move {
@@ -207,11 +199,7 @@ async fn session(
     } else {
         let scan = scan.context("workspace scan missing")?;
         proto::send_msg(&mut w, &Msg::Manifest { files: scan.files.clone() }).await?;
-        let need = wait_for(&mut r, |m| match m {
-            Msg::Need { hashes } => Some(hashes),
-            _ => None,
-        })
-        .await?;
+        let need = wait_for(&mut r, |m| if let Msg::Need { hashes } = m { Some(hashes) } else { None }).await?;
         let n = need.len();
         for hash in need {
             let src = scan.by_hash.get(&hash).context("server requested an unknown blob")?;
@@ -224,11 +212,7 @@ async fn session(
         }
     }
     if detach {
-        let job = wait_for(&mut r, |m| match m {
-            Msg::Started { job } => Some(job),
-            _ => None,
-        })
-        .await?;
+        let job = wait_for(&mut r, |m| if let Msg::Started { job } = m { Some(job) } else { None }).await?;
         eprintln!("exzec: job {job} on {}", srv.addr);
         return Ok(0);
     }
@@ -320,11 +304,7 @@ async fn ps(servers: &[Server]) -> Result<i32> {
                 continue;
             }
         };
-        let jobs = wait_for(&mut r, |m| match m {
-            Msg::Jobs { jobs } => Some(jobs),
-            _ => None,
-        })
-        .await?;
+        let jobs = wait_for(&mut r, |m| if let Msg::Jobs { jobs } = m { Some(jobs) } else { None }).await?;
         for j in jobs {
             let st = j.code.map_or("running".to_string(), |c| format!("exit {c}"));
             println!("{}  {:<20} {:<10} {}", j.job, j.name, st, s.addr);
@@ -390,7 +370,8 @@ fn parse_entry(e: &str) -> Server {
         Some((t, a)) => (t.to_string(), a.to_string()),
         None => (String::new(), e.to_string()),
     };
-    let addr = if addr.contains(':') { addr } else { format!("{addr}:{}", exzet::DEFAULT_PORT) };
+    let ported = addr.rsplit_once(':').is_some_and(|(h, p)| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()) && (!h.contains(':') || h.ends_with(']')));
+    let addr = if ported { addr } else { format!("{addr}:{}", exzet::DEFAULT_PORT) };
     Server { addr, token }
 }
 
@@ -408,41 +389,38 @@ fn config_entries() -> Vec<String> {
 
 fn emit(world: u32, rank: u32, err: bool, data: &[u8], lines: &mut HashMap<(u32, bool), Vec<u8>>) {
     if world <= 1 {
-        write_stream(err, data);
-        return;
+        return write_stream(err, data);
     }
     let buf = lines.entry((rank, err)).or_default();
     buf.extend_from_slice(data);
     while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
         let line: Vec<u8> = buf.drain(..=pos).collect();
-        let mut out = format!("[{rank}] ").into_bytes();
-        out.extend_from_slice(&line);
-        write_stream(err, &out);
+        write_stream(err, &prefixed(rank, &line));
     }
+    if buf.len() > proto::CHUNK {
+        write_stream(err, &prefixed(rank, &std::mem::take(buf)));
+    }
+}
+
+fn prefixed(rank: u32, data: &[u8]) -> Vec<u8> {
+    let mut out = format!("[{rank}] ").into_bytes();
+    out.extend_from_slice(data);
+    out
 }
 
 fn flush_lines(lines: &mut HashMap<(u32, bool), Vec<u8>>) {
     for ((rank, err), mut buf) in lines.drain() {
-        if buf.is_empty() {
-            continue;
+        if !buf.is_empty() {
+            buf.push(b'\n');
+            write_stream(err, &prefixed(rank, &buf));
         }
-        buf.push(b'\n');
-        let mut out = format!("[{rank}] ").into_bytes();
-        out.extend_from_slice(&buf);
-        write_stream(err, &out);
     }
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
 }
 
 fn write_stream(err: bool, data: &[u8]) {
-    if err {
-        let mut se = std::io::stderr().lock();
-        let _ = se.write_all(data);
-        let _ = se.flush();
-    } else {
-        let mut so = std::io::stdout().lock();
-        let _ = so.write_all(data);
-        let _ = so.flush();
-    }
+    let (mut o, mut e);
+    let s: &mut dyn Write = if err { e = std::io::stderr().lock(); &mut e } else { o = std::io::stdout().lock(); &mut o };
+    let _ = s.write_all(data).and_then(|()| s.flush());
 }

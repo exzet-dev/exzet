@@ -37,6 +37,7 @@ async fn main() -> Result<()> {
     let mut state = default_state_dir();
     let mut token_arg: Option<String> = None;
     let mut containers = true;
+    let mut svc: Option<bool> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -50,22 +51,20 @@ async fn main() -> Result<()> {
                     .parse()
                     .context("--containers needs true or false")?
             }
-            "--service" => return service(true),
-            "--disable" => return service(false),
+            "--service" => svc = Some(true),
+            "--disable" => svc = Some(false),
             other => bail!(
                 "unknown flag '{other}' (flags: --listen --state --token --containers --service --disable)"
             ),
         }
     }
+    if let Some(enable) = svc {
+        return service(enable, &listen, &state, token_arg, containers);
+    }
     if containers && !rustix::process::geteuid().is_root() {
-        let rootful_docker = tokio::process::Command::new("docker")
-            .args(["info", "-f", "{{.SecurityOptions}}"])
-            .output()
-            .await
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| !String::from_utf8_lossy(&o.stdout).contains("rootless"));
-        if rootful_docker == Some(true) {
+        let root_sock = std::fs::metadata("/var/run/docker.sock")
+            .is_ok_and(|m| std::os::unix::fs::MetadataExt::uid(&m) == 0);
+        if root_sock {
             bail!(
                 "exzed is unprivileged but docker creates containers as root, which would outrank it; \
                  run exzed with sudo (at or above the container runtime's privilege level), \
@@ -74,6 +73,24 @@ async fn main() -> Result<()> {
         }
     }
     std::fs::create_dir_all(&state).with_context(|| format!("creating {}", state.display()))?;
+    for e in std::fs::read_dir(state.join("jobs")).into_iter().flatten().flatten() {
+        let _ = rustix::mount::unmount(&e.path().join("work"), rustix::mount::UnmountFlags::DETACH);
+        let _ = std::fs::remove_dir_all(e.path());
+    }
+    for e in std::fs::read_dir(&state).into_iter().flatten().flatten() {
+        if e.file_name().to_string_lossy().starts_with("tmp-") { let _ = std::fs::remove_file(e.path()); }
+    }
+    let old = std::time::SystemTime::now() - Duration::from_secs(30 * 86400);
+    for e in std::fs::read_dir(state.join("cas")).into_iter().flatten().flatten() {
+        for f in std::fs::read_dir(e.path()).into_iter().flatten().flatten() {
+            if f.metadata().and_then(|m| m.modified()).is_ok_and(|t| t < old) { let _ = std::fs::remove_file(f.path()); }
+        }
+    }
+    for e in std::fs::read_dir(Path::new(cell::CG_ROOT).join("exzet")).into_iter().flatten().flatten() {
+        let _ = std::fs::write(e.path().join("cgroup.kill"), "1");
+        let _ = std::fs::remove_dir(e.path());
+    }
+    let _ = Command::new("sh").args(["-c", "docker rm -f $(docker ps -aq -f name=^exzet-)"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
     let token = match token_arg {
         Some(t) => t,
         None => load_or_make_token(&state)?,
@@ -87,9 +104,7 @@ async fn main() -> Result<()> {
         tunnels: Mutex::new(HashMap::new()),
         jobs: Mutex::new(HashMap::new()),
     });
-    let l = TcpListener::bind(&listen)
-        .await
-        .with_context(|| format!("binding {listen}"))?;
+    let l = TcpListener::bind(&listen).await.with_context(|| format!("binding {listen}"))?;
     eprintln!("exzed listening on {listen}");
     eprintln!("server entry: {token}@{}:{}", host(), l.local_addr()?.port());
     if !rustix::process::geteuid().is_root() {
@@ -106,7 +121,7 @@ async fn main() -> Result<()> {
     }
 }
 
-fn service(enable: bool) -> Result<()> {
+fn service(enable: bool, listen: &str, state: &Path, token: Option<String>, containers: bool) -> Result<()> {
     let root = rustix::process::geteuid().is_root();
     let run = |args: &[&str]| -> Result<bool> {
         let mut c = Command::new("systemctl");
@@ -123,30 +138,34 @@ fn service(enable: bool) -> Result<()> {
             .join("systemd/user/exzed.service")
     };
     if !enable {
-        let _ = run(&["disable", "--now", "exzed"]);
-        let _ = std::fs::remove_file(&unit);
+        if !run(&["disable", "--now", "exzed"])? || std::fs::remove_file(&unit).is_err() {
+            bail!("no exzed service at this privilege level");
+        }
         let _ = run(&["daemon-reload"]);
         return Ok(());
     }
-    let state = default_state_dir();
-    std::fs::create_dir_all(&state)?;
-    let token = load_or_make_token(&state)?;
+    std::fs::create_dir_all(state)?;
+    if let Some(t) = &token {
+        std::fs::write(state.join("token"), t)?;
+        std::fs::set_permissions(state.join("token"), std::fs::Permissions::from_mode(0o600))?;
+    }
+    let token = load_or_make_token(state)?;
     std::fs::create_dir_all(unit.parent().context("no unit dir")?)?;
     let wanted = if root { "multi-user.target" } else { "default.target" };
     std::fs::write(
         &unit,
         format!(
-            "[Unit]\nDescription=exzet daemon\n\n[Service]\nExecStart={}\nRestart=always\n\n[Install]\nWantedBy={wanted}\n",
-            std::env::current_exe()?.display()
+            "[Unit]\nDescription=exzet daemon\nAfter=network.target\n\n[Service]\nExecStart=\"{}\" --listen {listen} --state \"{}\" --containers {containers}\nRestart=always\n\n[Install]\nWantedBy={wanted}\n",
+            std::env::current_exe()?.display(), state.display()
         ),
     )?;
-    if !run(&["daemon-reload"])? || !run(&["enable", "--now", "exzed"])? {
+    if !run(&["daemon-reload"])? || !run(&["enable", "exzed"])? || !run(&["restart", "exzed"])? {
         bail!("systemctl failed");
     }
-    if !root {
-        let _ = Command::new("loginctl").arg("enable-linger").status();
+    if !root && !Command::new("loginctl").arg("enable-linger").status()?.success() {
+        eprintln!("exzed: enable-linger failed, service stops at logout");
     }
-    eprintln!("server entry: {token}@{}:{}", host(), exzet::DEFAULT_PORT);
+    eprintln!("server entry: {token}@{}:{}", host(), listen.rsplit(':').next().unwrap_or("7433"));
     Ok(())
 }
 
@@ -154,6 +173,11 @@ fn host() -> String {
     std::env::var("SSH_CONNECTION")
         .ok()
         .and_then(|c| c.split_whitespace().nth(2).map(str::to_string))
+        .or_else(|| {
+            let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+            s.connect("1.1.1.1:53").ok()?;
+            Some(s.local_addr().ok()?.ip().to_string())
+        })
         .unwrap_or_else(|| rustix::system::uname().nodename().to_string_lossy().into_owned())
 }
 
@@ -161,11 +185,9 @@ fn default_state_dir() -> PathBuf {
     if rustix::process::geteuid().is_root() {
         PathBuf::from("/var/lib/exzet")
     } else {
-        std::env::var_os("XDG_STATE_HOME")
-            .map(PathBuf::from)
+        std::env::var_os("XDG_STATE_HOME").map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join("exzet")
+            .unwrap_or_else(|| PathBuf::from("/tmp")).join("exzet")
     }
 }
 
@@ -228,8 +250,7 @@ async fn handle(d: Arc<Daemon>, conn: TcpStream) -> Result<()> {
     }
 }
 
-// client may be mid-send when we error; read until it sees the Err and closes,
-// else closing with unread data RSTs the connection and the message is lost
+// unread data RSTs the Err
 async fn drain(mut r: OwnedReadHalf) {
     let mut buf = [0u8; 65536];
     while let Ok(Ok(n)) = tokio::time::timeout(Duration::from_secs(5), r.read(&mut buf)).await {
@@ -252,23 +273,23 @@ async fn run_job(
     let job = rand_hex(6);
     let jobdir = d.state.join("jobs").join(&job);
     let work = jobdir.join("work");
-    let mut mounted = false;
 
     let mut ro = Some(r);
-    let res = prepare(d, &mut ro, w, &task, rank0, ranks, detach, &work, &mut mounted).await;
+    let res = prepare(d, &mut ro, w, &task, rank0, ranks, detach, &work).await;
     if let Err(e) = &res {
         let _ = proto::send_msg(w, &Msg::Err { msg: format!("{e:#}") }).await;
         if let Some(r) = ro.take() {
             drain(r).await;
         }
+        let _ = rustix::mount::unmount(&work, rustix::mount::UnmountFlags::DETACH);
         let _ = std::fs::remove_dir_all(&jobdir);
         return res.map(|_| 0);
     }
 
+    let (ktx, mut krx) = mpsc::channel::<()>(1);
+    let entry = JobEntry { name: task.name.clone(), world: task.replicas, code: None, kill: ktx.clone() };
+    d.jobs.lock().await.insert(job.clone(), entry);
     if detach {
-        let (ktx, mut krx) = mpsc::channel::<()>(1);
-        let entry = JobEntry { name: task.name.clone(), world: task.replicas, code: None, kill: ktx };
-        d.jobs.lock().await.insert(job.clone(), entry);
         proto::send_msg(w, &Msg::Started { job: job.clone() }).await?;
         let d = d.clone();
         tokio::spawn(async move {
@@ -290,13 +311,12 @@ async fn run_job(
         return Ok(0);
     }
 
-    let (ktx, krx) = oneshot::channel::<()>();
     let mut cr = ro.take().context("connection consumed")?;
     tokio::spawn(async move {
         loop {
             match proto::recv_msg(&mut cr).await {
                 Ok(Msg::Kill) | Err(_) => {
-                    let _ = ktx.send(());
+                    let _ = ktx.send(()).await;
                     break;
                 }
                 Ok(_) => {}
@@ -304,15 +324,14 @@ async fn run_job(
         }
     });
     let kill = async {
-        let _ = krx.await;
+        let _ = krx.recv().await;
     };
     let res = run_task(w, &task, rank0, ranks, &main, &job, &work, kill).await;
+    d.jobs.lock().await.remove(&job);
     if let Err(e) = &res {
         let _ = proto::send_msg(w, &Msg::Err { msg: format!("{e:#}") }).await;
     }
-    if mounted {
-        let _ = rustix::mount::unmount(&work, rustix::mount::UnmountFlags::DETACH);
-    }
+    let _ = rustix::mount::unmount(&work, rustix::mount::UnmountFlags::DETACH);
     let _ = std::fs::remove_dir_all(&jobdir);
     res
 }
@@ -326,10 +345,12 @@ async fn prepare(
     ranks: u32,
     detach: bool,
     work: &Path,
-    mounted: &mut bool,
 ) -> Result<()> {
     if ranks == 0 || rank0.checked_add(ranks).is_none_or(|e| e > task.replicas) {
         bail!("bad rank range");
+    }
+    if (task.cpus.is_some() || task.mem_bytes.is_some()) && task.image.is_none() && cell::limits_off() {
+        proto::send_msg(w, &Msg::Warn { msg: "cpu/mem limits unenforced on this server".into() }).await?;
     }
     if task.live && task.replicas > 1 {
         bail!("live workspace requires replicas = 1");
@@ -345,13 +366,9 @@ async fn prepare(
         if !cell::docker_ready().await {
             bail!("docker is not installed or not running on this server");
         }
-        let cached = tokio::process::Command::new("docker")
-            .args(["image", "inspect", image])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await?
-            .success();
+        let mut insp = tokio::process::Command::new("docker");
+        insp.args(["image", "inspect", image]).stdout(Stdio::null()).stderr(Stdio::null());
+        let cached = insp.status().await?.success();
         if !cached {
             proto::send_msg(w, &Msg::Warn { msg: format!("pulling image {image}") }).await?;
             let out = tokio::process::Command::new("docker").args(["pull", image]).output().await?;
@@ -382,29 +399,19 @@ async fn prepare(
         };
         tokio::spawn(proto::mux_acceptor(tconn, gate));
         let _ = tokio::process::Command::new("modprobe").arg("nfs").status().await;
-        // kernel performs the MNT rpc itself; nolock skips NLM
+        // kernel mounts; nolock skips NLM
         let data = std::ffi::CString::new(format!(
             "vers=3,proto=tcp,addr=127.0.0.1,port={port},mountvers=3,mountproto=tcp,mountport={port},nolock,soft,timeo=100,retrans=3,actimeo=1"
         ))?;
         let target = work.to_path_buf();
-        let mountres = tokio::time::timeout(
-            Duration::from_secs(30),
-            tokio::task::spawn_blocking(move || {
-                rustix::mount::mount(
-                    "127.0.0.1:/",
-                    &target,
-                    "nfs",
-                    rustix::mount::MountFlags::empty(),
-                    Some(data.as_c_str()),
-                )
-            }),
-        )
+        let mountres = tokio::task::spawn_blocking(move || {
+            rustix::mount::mount("127.0.0.1:/", &target, "nfs", rustix::mount::MountFlags::empty(), Some(data.as_c_str()))
+        })
         .await;
         match mountres {
-            Ok(Ok(Ok(()))) => *mounted = true,
-            Ok(Ok(Err(e))) => bail!("nfs mount failed: {e}"),
+            Ok(Ok(())) => {}
             Ok(Err(e)) => bail!("nfs mount failed: {e}"),
-            Err(_) => bail!("nfs mount timed out"),
+            Err(e) => bail!("nfs mount failed: {e}"),
         }
     } else {
         let r = ro.as_mut().context("connection consumed")?;
@@ -487,6 +494,7 @@ async fn run_task<W: AsyncWrite + Unpin>(
             proto::send_file(w, &abs).await?;
         }
     }
+    let _ = rustix::mount::unmount(work, rustix::mount::UnmountFlags::DETACH);
     proto::send_msg(w, &Msg::Exit { code }).await?;
     Ok(code)
 }
@@ -494,13 +502,11 @@ async fn run_task<W: AsyncWrite + Unpin>(
 async fn forward<W: AsyncWrite + Unpin>(mut orx: mpsc::Receiver<cell::Chunk>, w: &mut W) -> Result<()> {
     let mut res = Ok(());
     while let Some((rank, err, data)) = orx.recv().await {
-        if res.is_err() {
-            continue;
+        if res.is_ok() {
+            res = proto::send_msg(w, &Msg::Out { rank, err }).await;
         }
-        if let Err(e) = proto::send_msg(w, &Msg::Out { rank, err }).await {
-            res = Err(e);
-        } else if let Err(e) = proto::send_raw(w, &data).await {
-            res = Err(e);
+        if res.is_ok() {
+            res = proto::send_raw(w, &data).await;
         }
     }
     res
@@ -513,6 +519,10 @@ async fn attach_job(d: Arc<Daemon>, mut r: OwnedReadHalf, mut w: OwnedWriteHalf,
             let _ = proto::send_msg(&mut w, &Msg::Err { msg: format!("unknown job '{job}'") }).await;
             bail!("unknown job '{job}'");
         }
+    };
+    let Ok(mut f) = tokio::fs::File::open(d.state.join("jobs").join(&job).join("log")).await else {
+        let _ = proto::send_msg(&mut w, &Msg::Err { msg: format!("job '{job}' is not detached") }).await;
+        bail!("job '{job}' has no log");
     };
     proto::send_msg(&mut w, &Msg::Attached { world }).await?;
     let (d2, job2) = (d.clone(), job.clone());
@@ -530,7 +540,6 @@ async fn attach_job(d: Arc<Daemon>, mut r: OwnedReadHalf, mut w: OwnedWriteHalf,
             }
         }
     });
-    let mut f = tokio::fs::File::open(d.state.join("jobs").join(&job).join("log")).await?;
     let mut buf = vec![0u8; 64 << 10];
     let mut done = false;
     loop {
@@ -567,8 +576,7 @@ fn collect_outputs(work: &Path, specs: &[String]) -> Result<(Vec<(String, PathBu
 
 fn collect_path(work: &Path, p: &Path, v: &mut Vec<(String, PathBuf)>) -> Result<()> {
     if p.is_file() {
-        let rel = p.strip_prefix(work)?.to_string_lossy().into_owned();
-        v.push((rel, p.to_path_buf()));
+        v.push((p.strip_prefix(work)?.to_string_lossy().into_owned(), p.to_path_buf()));
     } else if p.is_dir() {
         for e in std::fs::read_dir(p)? {
             collect_path(work, &e?.path(), v)?;

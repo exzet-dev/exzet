@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
-const CG_ROOT: &str = "/sys/fs/cgroup";
+pub const CG_ROOT: &str = "/sys/fs/cgroup";
 
 pub type Chunk = (u32, bool, Vec<u8>);
 
@@ -29,20 +29,17 @@ struct Handle {
 }
 
 pub async fn docker_ready() -> bool {
-    Command::new("docker")
-        .arg("version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .map(|s| s.success())
-        .unwrap_or(false)
+    let ver = Command::new("docker").arg("version").stdout(Stdio::null()).stderr(Stdio::null()).status();
+    ver.await.map(|s| s.success()).unwrap_or(false)
+}
+
+pub fn limits_off() -> bool {
+    !rustix::process::geteuid().is_root()
+        || !Path::new(CG_ROOT).join("cgroup.controllers").is_file()
 }
 
 fn make_cgroup(name: &str, task: &Task) -> Option<PathBuf> {
-    if !rustix::process::geteuid().is_root()
-        || !Path::new(CG_ROOT).join("cgroup.controllers").is_file()
-    {
+    if limits_off() {
         return None;
     }
     let base = Path::new(CG_ROOT).join("exzet");
@@ -71,10 +68,8 @@ fn spawn(j: &Job, rank: u32) -> Result<(Child, Handle)> {
         Some(image) => {
             let name = format!("exzet-{}-{rank}", j.id);
             let mut cmd = Command::new("docker");
-            cmd.args(["run", "--rm", "--network", "host", "--name", &name])
-                .arg("-v")
-                .arg(format!("{}:/work", j.dir.display()))
-                .args(["-w", "/work", "--entrypoint", "/bin/sh"]);
+            cmd.args(["run", "--rm", "--network", "host", "--name", &name]).arg("-v")
+                .arg(format!("{}:/work", j.dir.display())).args(["-w", "/work", "--entrypoint", "/bin/sh"]);
             for (k, v) in &envs {
                 cmd.arg("-e").arg(format!("{k}={v}"));
             }
@@ -91,9 +86,13 @@ fn spawn(j: &Job, rank: u32) -> Result<(Child, Handle)> {
             (cmd, Handle { pid: None, cgroup: None, container: Some(name) })
         }
         None => {
-            let mut cmd = Command::new("/bin/sh");
-            cmd.arg("-euc").arg(&j.task.script).current_dir(j.dir).envs(envs);
             let cgroup = make_cgroup(&format!("{}-{rank}", j.id), j.task);
+            let script = match &cgroup {
+                Some(cg) => format!("echo $$ >{}/cgroup.procs\n{}", cg.display(), j.task.script),
+                None => j.task.script.clone(),
+            };
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-euc").arg(script).current_dir(j.dir).envs(envs);
             (cmd, Handle { pid: None, cgroup, container: None })
         }
     };
@@ -105,9 +104,6 @@ fn spawn(j: &Job, rank: u32) -> Result<(Child, Handle)> {
     }
     let child = cmd.spawn().context("spawning cell")?;
     handle.pid = child.id();
-    if let (Some(cg), Some(pid)) = (&handle.cgroup, handle.pid) {
-        let _ = fs::write(cg.join("cgroup.procs"), pid.to_string());
-    }
     Ok((child, handle))
 }
 
@@ -174,10 +170,9 @@ pub async fn run(
             p.abort();
         }
     }
-    for h in &handles {
-        if let Some(cg) = &h.cgroup {
-            let _ = fs::remove_dir(cg);
-        }
+    for cg in handles.iter().filter_map(|h| h.cgroup.as_ref()) {
+        let _ = fs::write(cg.join("cgroup.kill"), "1");
+        let _ = fs::remove_dir(cg);
     }
     if timed_out {
         code = 124;

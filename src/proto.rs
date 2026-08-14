@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, Mutex};
 
 pub const CHUNK: usize = 1 << 20;
 const MAX_FRAME: usize = CHUNK + 64;
+const MAX_MSG: usize = 1 << 26;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FileEntry {
@@ -56,11 +57,18 @@ pub enum Frame {
 }
 
 async fn send_frame<W: AsyncWrite + Unpin>(w: &mut W, tag: u8, body: &[u8]) -> Result<()> {
-    w.write_u32((body.len() + 1) as u32).await?;
-    w.write_u8(tag).await?;
-    w.write_all(body).await?;
-    w.flush().await?;
-    Ok(())
+    let mut rest = body;
+    loop {
+        let n = rest.len().min(CHUNK);
+        let more = ((rest.len() > n) as u32) << 31;
+        w.write_u32((n as u32 + 1) | more).await?;
+        w.write_u8(tag).await?;
+        w.write_all(&rest[..n]).await?;
+        rest = &rest[n..];
+        if more == 0 {
+            break w.flush().await.map_err(Into::into);
+        }
+    }
 }
 
 pub async fn send_msg<W: AsyncWrite + Unpin>(w: &mut W, msg: &Msg) -> Result<()> {
@@ -72,13 +80,21 @@ pub async fn send_raw<W: AsyncWrite + Unpin>(w: &mut W, bytes: &[u8]) -> Result<
 }
 
 pub async fn recv<R: AsyncRead + Unpin>(r: &mut R) -> Result<Frame> {
-    let len = r.read_u32().await.context("connection closed")? as usize;
-    if len == 0 || len > MAX_FRAME {
-        bail!("bad frame length {len}");
-    }
-    let tag = r.read_u8().await?;
-    let mut buf = vec![0u8; len - 1];
-    r.read_exact(&mut buf).await?;
+    let mut buf = Vec::new();
+    let tag = loop {
+        let head = r.read_u32().await.context("connection closed")? as usize;
+        let len = head & 0x7fff_ffff;
+        if len == 0 || len > MAX_FRAME || buf.len() + len > MAX_MSG {
+            bail!("bad frame length {len}");
+        }
+        let tag = r.read_u8().await?;
+        let at = buf.len();
+        buf.resize(at + len - 1, 0);
+        r.read_exact(&mut buf[at..]).await?;
+        if head >> 31 == 0 {
+            break tag;
+        }
+    };
     match tag {
         b'J' => Ok(Frame::Json(serde_json::from_slice(&buf)?)),
         b'R' => Ok(Frame::Raw(buf)),
@@ -115,9 +131,7 @@ where
 }
 
 pub async fn send_file<W: AsyncWrite + Unpin>(w: &mut W, path: &Path) -> Result<()> {
-    let mut f = tokio::fs::File::open(path)
-        .await
-        .with_context(|| format!("opening {}", path.display()))?;
+    let mut f = tokio::fs::File::open(path).await.with_context(|| format!("opening {}", path.display()))?;
     let mut buf = vec![0u8; CHUNK];
     loop {
         let n = f.read(&mut buf).await?;
@@ -154,21 +168,19 @@ pub async fn mux_acceptor(tunnel: TcpStream, listener: TcpListener) {
     let (tx, rx) = mpsc::channel(32);
     tokio::spawn(tunnel_writer(tw, rx));
     let streams: Streams = Arc::default();
-    {
-        let streams = streams.clone();
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let mut next = 1u32;
-            while let Ok((conn, _)) = listener.accept().await {
-                let id = next;
-                next += 1;
-                let (ltx, lrx) = mpsc::channel(32);
-                streams.lock().await.insert(id, ltx);
-                tokio::spawn(pump_local(id, conn, tx.clone(), lrx));
-            }
-        });
+    let accept = async {
+        let mut next = 1u32;
+        while let Ok((conn, _)) = listener.accept().await {
+            let (ltx, lrx) = mpsc::channel(32);
+            streams.lock().await.insert(next, ltx);
+            tokio::spawn(pump_local(next, conn, tx.clone(), lrx));
+            next += 1;
+        }
+    };
+    tokio::select! {
+        _ = accept => {}
+        _ = demux(tr, streams.clone(), None, tx.clone()) => {}
     }
-    demux(tr, streams, None, tx).await;
 }
 
 pub async fn mux_dialer(tunnel: TcpStream, target: SocketAddr) {

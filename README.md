@@ -9,7 +9,7 @@ exzed (daemon) + exzec (client) + exfile (task file) = exzet
 curl -fsSL https://exzet.net/install.sh | sh
 ```
 
-Static binaries (`exzec` + `exzed`), x86_64/aarch64 linux, also on [releases](https://github.com/exzet-dev/exzet/releases).
+Static binaries (`exzec` + `exzed`) for linux/macos (x86_64 + aarch64) and windows (x86_64) on [releases](https://github.com/exzet-dev/exzet/releases).
 
 From source: `cargo install --git https://github.com/exzet-dev/exzet`
 
@@ -57,11 +57,19 @@ exzec attach <job> # replay + follow output, ctrl-c kills it
 ### exfile syntax
 
 - `[key: value, ...]` = attributes for task
-- `key := value` = for all tasks in exfile, see below
+- `key := value` = for all tasks in exfile
+- `[ENV_EXAMPLE := value, ...]` = env for task
+- `ENV_EXAMPLE := value` = for all tasks in exfile
+- `${ENV_EXAMPLE}` expands when setting values
+- `.env` beside the exfile auto-loads into exzec env
+- `build: check lint` = serialized dependencies just like every other task runner
+- `exzec task a b` -> `$0` = "task", `$1` = "a", `$2` = "b"
+- `#!` shebangs override shell
 
 | key | example | |
 |---|---|---|
 | `servers` | `token@host:7433` | space-separated, first reachable |
+| `shell` | `bash -euc` | default `sh -euc` on mac/linux, powershell on windows |
 | `image` | `rust:1` | docker image workspace, overrides entrypoint |
 | `cpus` | `8` | cpu limit |
 | `mem` | `64g` | k/m/g/t |
@@ -98,6 +106,18 @@ Needs a server and the sync workspace. Job list resets when exzed restarts.
 ### live
 
 When a server is configured, `exzec --live <task>` or `[workspace: live]` will serve your working tree over NFS and `exzed` mounts it as the task's working directory.
-NFS rides a second client-dialed connection to the same server port, so no new ports and your machine never needs to be reachable.
+NFS uses the client-dialed connection on the same server port, so no new ports and your machine ever need to be exposed.
 Unlike sync, `.gitignore` is ignored and `exzed` sees the whole tree.
 Needs root owned `exzed` and `replicas: 1`.
+
+### platforms
+
+Doing everything I can to keep everything running exactly the same on every platform:
+
+| | linux | macos | windows |
+|---|---|---|---|
+| run/kill | process groups | process groups | job objects |
+| `cpus`/`mem` | cgroup v2 (root) | off, warns | job objects |
+| live workspace | kernel nfs mount (root) | `mount_nfs` (root) | needs 'Client for NFS' Windows feature on in OS |
+| `--service` | systemd | launchd | scheduled task |
+| docker/`gpus` | wherever docker runs | same | same |

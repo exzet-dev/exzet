@@ -3,7 +3,6 @@ use anyhow::{bail, Context, Result};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub fn hash_file(path: &Path) -> Result<String> {
@@ -55,7 +54,7 @@ pub fn scan(root: &Path) -> Result<Scan> {
             by_hash.insert(hash.clone(), path.to_path_buf());
             files.push(FileEntry {
                 path: rel,
-                mode: meta.permissions().mode() & 0o777,
+                mode: crate::mode_of(&meta),
                 hash,
                 link: None,
             });
@@ -96,7 +95,7 @@ impl Store {
         }
         let dest = self.blob_path(hash);
         fs::create_dir_all(dest.parent().unwrap())?;
-        fs::set_permissions(tmp, fs::Permissions::from_mode(0o444))?;
+        crate::set_mode(tmp, 0o444)?;
         fs::rename(tmp, &dest)?;
         Ok(())
     }
@@ -108,12 +107,17 @@ impl Store {
                 fs::create_dir_all(p)?;
             }
             match &f.link {
-                Some(t) => symlink(t, &target)
-                    .with_context(|| format!("linking {}", f.path))?,
+                Some(t) => {
+                    #[cfg(unix)]
+                    let r = std::os::unix::fs::symlink(t, &target);
+                    #[cfg(windows)]
+                    let r = std::os::windows::fs::symlink_file(t, &target);
+                    r.with_context(|| format!("linking {}", f.path))?
+                }
                 None => {
                     fs::copy(self.blob_path(&f.hash), &target)
                         .with_context(|| format!("hydrating {}", f.path))?;
-                    fs::set_permissions(&target, fs::Permissions::from_mode(f.mode | 0o600))?;
+                    crate::set_mode(&target, f.mode | 0o600)?;
                 }
             }
         }

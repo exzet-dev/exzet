@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+#[cfg(unix)]
 use nfsserve::fs_util::{metadata_to_fattr3, path_setattr};
 use nfsserve::nfs::{fattr3, fileid3, filename3, nfspath3, nfsstat3, sattr3};
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
@@ -6,8 +7,12 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -94,6 +99,36 @@ impl WorkspaceFs {
     }
 }
 
+#[cfg(windows)]
+fn metadata_to_fattr3(fid: fileid3, meta: &fs::Metadata) -> fattr3 {
+    use nfsserve::nfs::{ftype3, nfstime3};
+    let t = |st: io::Result<std::time::SystemTime>| {
+        let d = st.ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).unwrap_or_default();
+        nfstime3 { seconds: d.as_secs() as u32, nseconds: d.subsec_nanos() }
+    };
+    fattr3 {
+        ftype: if meta.is_dir() { ftype3::NF3DIR } else if meta.is_symlink() { ftype3::NF3LNK } else { ftype3::NF3REG },
+        mode: 0o755,
+        nlink: 1,
+        size: meta.len(),
+        used: meta.len(),
+        fileid: fid,
+        atime: t(meta.accessed()),
+        mtime: t(meta.modified()),
+        ctime: t(meta.modified()),
+        ..Default::default()
+    }
+}
+
+#[cfg(windows)]
+async fn path_setattr(path: &Path, s: &sattr3) -> Result<(), nfsstat3> {
+    if let nfsserve::nfs::set_size3::size(sz) = s.size {
+        let f = fs::OpenOptions::new().write(true).open(path).map_err(nerr)?;
+        f.set_len(sz).map_err(nerr)?;
+    }
+    Ok(())
+}
+
 fn nerr(e: io::Error) -> nfsstat3 {
     match e.kind() {
         io::ErrorKind::NotFound => nfsstat3::NFS3ERR_NOENT,
@@ -107,8 +142,42 @@ fn nerr(e: io::Error) -> nfsstat3 {
 fn osname(n: &filename3) -> Result<&OsStr, nfsstat3> {
     match n.as_ref() as &[u8] {
         b"" | b".." => Err(nfsstat3::NFS3ERR_ACCES),
-        b if b.contains(&b'/') => Err(nfsstat3::NFS3ERR_ACCES),
-        b => Ok(OsStr::from_bytes(b)),
+        b if b.contains(&b'/') || b.contains(&b'\\') => Err(nfsstat3::NFS3ERR_ACCES),
+        b => {
+            #[cfg(unix)]
+            return Ok(OsStr::from_bytes(b));
+            #[cfg(windows)]
+            std::str::from_utf8(b).map(OsStr::new).map_err(|_| nfsstat3::NFS3ERR_ACCES)
+        }
+    }
+}
+
+fn namebytes(n: &OsStr) -> Vec<u8> {
+    #[cfg(unix)]
+    return n.as_bytes().to_vec();
+    #[cfg(windows)]
+    n.to_string_lossy().into_owned().into_bytes()
+}
+
+fn pread(f: &fs::File, buf: &mut [u8], off: u64) -> io::Result<usize> {
+    #[cfg(unix)]
+    return f.read_at(buf, off);
+    #[cfg(windows)]
+    f.seek_read(buf, off)
+}
+
+fn pwrite_all(f: &fs::File, data: &[u8], off: u64) -> io::Result<()> {
+    #[cfg(unix)]
+    return f.write_all_at(data, off);
+    #[cfg(windows)]
+    {
+        let (mut data, mut off) = (data, off);
+        while !data.is_empty() {
+            let n = f.seek_write(data, off)?;
+            data = &data[n..];
+            off += n as u64;
+        }
+        Ok(())
     }
 }
 
@@ -170,7 +239,7 @@ impl NFSFileSystem for WorkspaceFs {
         let mut buf = vec![0u8; count as usize];
         let mut done = 0usize;
         while done < buf.len() {
-            let n = f.read_at(&mut buf[done..], offset + done as u64).map_err(nerr)?;
+            let n = pread(&f, &mut buf[done..], offset + done as u64).map_err(nerr)?;
             if n == 0 {
                 break;
             }
@@ -183,7 +252,7 @@ impl NFSFileSystem for WorkspaceFs {
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
         let path = self.path_of(id)?;
         let f = fs::OpenOptions::new().write(true).open(&path).map_err(nerr)?;
-        f.write_all_at(data, offset).map_err(nerr)?;
+        pwrite_all(&f, data, offset).map_err(nerr)?;
         self.getattr(id).await
     }
 
@@ -282,7 +351,7 @@ impl NFSFileSystem for WorkspaceFs {
             let id = self.id_for(path);
             entries.push(DirEntry {
                 fileid: id,
-                name: name.as_bytes().to_vec().into(),
+                name: namebytes(name).into(),
                 attr: metadata_to_fattr3(id, &meta),
             });
         }
@@ -296,13 +365,24 @@ impl NFSFileSystem for WorkspaceFs {
         symlink: &nfspath3,
         _attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        let target = OsStr::from_bytes(symlink.as_ref());
-        self.newnode(dirid, linkname, |p| std::os::unix::fs::symlink(target, p)).await
+        #[cfg(unix)]
+        {
+            let target = OsStr::from_bytes(symlink.as_ref());
+            self.newnode(dirid, linkname, |p| std::os::unix::fs::symlink(target, p)).await
+        }
+        #[cfg(windows)]
+        {
+            let _ = (dirid, linkname, symlink);
+            Err(nfsstat3::NFS3ERR_NOTSUPP)
+        }
     }
 
     async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
         let path = self.path_of(id)?;
         let target = fs::read_link(&path).map_err(nerr)?;
-        Ok(target.into_os_string().into_vec().into())
+        #[cfg(unix)]
+        return Ok(target.into_os_string().into_vec().into());
+        #[cfg(windows)]
+        Ok(target.to_string_lossy().into_owned().into_bytes().into())
     }
 }

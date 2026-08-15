@@ -5,11 +5,17 @@ use std::path::{Path, PathBuf};
 pub const FILE_NAME: &str = "exfile";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Task {
     pub name: String,
     pub script: String,
     #[serde(skip)]
     pub servers: Vec<String>,
+    #[serde(skip)]
+    pub deps: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub shell: String,
+    pub args: Vec<String>,
     pub image: Option<String>,
     pub cpus: Option<u32>,
     pub mem_bytes: Option<u64>,
@@ -49,10 +55,24 @@ pub fn resolve(start: &Path) -> Result<(PathBuf, PathBuf)> {
     }
 }
 
-pub fn parse(text: &str) -> Result<Vec<Task>> {
+pub fn dotenv(dir: &Path) -> Vec<(String, String)> {
+    std::fs::read_to_string(dir.join(".env"))
+        .map(|t| {
+            t.lines()
+                .map(str::trim)
+                .map(|l| l.strip_prefix("export ").unwrap_or(l))
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                .filter_map(|l| l.split_once('=').map(|(k, v)| (k.trim().to_string(), unquote(v))))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn parse(text: &str, dotenv: &[(String, String)]) -> Result<Vec<Task>> {
     let mut tasks: Vec<Task> = Vec::new();
     let mut defaults = Task {
         replicas: 1,
+        env: dotenv.to_vec(),
         ..Task::default()
     };
     let mut attrs: Vec<(String, String, usize)> = Vec::new();
@@ -84,29 +104,42 @@ pub fn parse(text: &str) -> Result<Vec<Task>> {
                 let (k, v) = part
                     .split_once(':')
                     .with_context(|| format!("line {n}: expected key: value inside [ ]"))?;
-                attrs.push((k.trim().to_string(), unquote(v), n));
+                let v = expand(&unquote(v), &defaults.env, n)?;
+                attrs.push((k.trim().to_string(), v, n));
             }
             continue;
         }
         if let Some((k, v)) = trimmed.split_once(":=") {
-            set(&mut defaults, k.trim(), &unquote(v), n)?;
+            let (k, v) = (k.trim(), expand(&unquote(v), &defaults.env, n)?);
+            if env_key(k) {
+                defaults.env.push((k.to_string(), v));
+            } else {
+                set(&mut defaults, k, &v, n)?;
+            }
             continue;
         }
-        if let Some(name) = trimmed.strip_suffix(':') {
+        if let Some((name, deps)) = trimmed.split_once(':') {
             let name = name.trim();
             if !valid_name(name) {
                 bail!("line {n}: invalid task name '{name}'");
             }
             let mut t = defaults.clone();
             t.name = name.to_string();
+            for d in deps.split_whitespace() {
+                if !valid_name(d) {
+                    bail!("line {n}: invalid dependency '{d}'");
+                }
+                t.deps.push(d.to_string());
+            }
             for (k, v, an) in attrs.drain(..) {
-                set(&mut t, &k, &v, an)?;
+                if env_key(&k) {
+                    t.env.push((k, v));
+                } else {
+                    set(&mut t, &k, &v, an)?;
+                }
             }
             cur = Some((t, Vec::new(), n));
             continue;
-        }
-        if trimmed.contains(':') {
-            bail!("line {n}: dependencies are not supported; compose tasks in your shell");
         }
         bail!("line {n}: unrecognized line '{trimmed}'");
     }
@@ -119,12 +152,40 @@ pub fn parse(text: &str) -> Result<Vec<Task>> {
     if tasks.is_empty() {
         bail!("no tasks defined");
     }
+    for t in &tasks {
+        schedule(&tasks, &t.name)?;
+    }
     Ok(tasks)
+}
+
+pub fn schedule<'a>(tasks: &'a [Task], name: &str) -> Result<Vec<&'a Task>> {
+    fn visit<'a>(tasks: &'a [Task], name: &str, path: &mut Vec<String>, out: &mut Vec<&'a Task>) -> Result<()> {
+        if out.iter().any(|t| t.name == name) {
+            return Ok(());
+        }
+        if path.iter().any(|p| p == name) {
+            bail!("dependency cycle at '{name}'");
+        }
+        let t = tasks.iter().find(|t| t.name == name).with_context(|| match path.last() {
+            Some(p) => format!("task '{p}' depends on unknown task '{name}'"),
+            None => format!("no task '{name}'"),
+        })?;
+        path.push(name.to_string());
+        for d in &t.deps {
+            visit(tasks, d, path, out)?;
+        }
+        path.pop();
+        out.push(t);
+        Ok(())
+    }
+    let mut out = Vec::new();
+    visit(tasks, name, &mut Vec::new(), &mut out)?;
+    Ok(out)
 }
 
 fn finish_task(tasks: &mut Vec<Task>, mut t: Task, lines: &[String], hn: usize) -> Result<()> {
     t.script = dedent(lines);
-    if t.script.trim().is_empty() {
+    if t.script.is_empty() && t.deps.is_empty() {
         bail!("task '{}' (line {hn}) has an empty body", t.name);
     }
     if t.live && t.replicas > 1 {
@@ -140,9 +201,41 @@ fn finish_task(tasks: &mut Vec<Task>, mut t: Task, lines: &[String], hn: usize) 
     Ok(())
 }
 
+fn expand(v: &str, vars: &[(String, String)], n: usize) -> Result<String> {
+    let mut out = String::new();
+    let mut rest = v;
+    while let Some(i) = rest.find("${") {
+        out.push_str(&rest[..i]);
+        let end = rest[i..].find('}').with_context(|| format!("line {n}: unclosed ${{"))? + i;
+        let name = &rest[i + 2..end];
+        let val = vars
+            .iter()
+            .rev()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+            .with_context(|| format!("line {n}: undefined variable '{name}'"))?;
+        out.push_str(val);
+        rest = &rest[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
+}
+
+fn env_key(s: &str) -> bool {
+    let mut chars = s.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_uppercase() || c == '_')
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
 fn set(t: &mut Task, k: &str, v: &str, n: usize) -> Result<()> {
     match k {
         "servers" => t.servers = v.split_whitespace().map(str::to_string).collect(),
+        "shell" => {
+            if v.trim().is_empty() {
+                bail!("line {n}: shell needs a command");
+            }
+            t.shell = v.to_string();
+        }
         "image" => t.image = Some(v.to_string()),
         "cpus" => t.cpus = Some(num(v, n)?),
         "mem" => t.mem_bytes = Some(size(v, n)?),
@@ -164,7 +257,7 @@ fn set(t: &mut Task, k: &str, v: &str, n: usize) -> Result<()> {
                 .filter(|s| !s.is_empty())
                 .collect()
         }
-        _ => bail!("line {n}: unknown key '{k}'"),
+        _ => bail!("line {n}: unknown key '{k}' (UPPERCASE keys define env vars)"),
     }
     Ok(())
 }

@@ -8,7 +8,6 @@ use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
@@ -45,12 +44,12 @@ async fn run() -> Result<i32> {
             "--server" => cli_servers.push(args.next().context("--server needs [token@]host[:port]")?),
             "--exfile" | "-f" => exfile_arg = Some(args.next().context("-f needs a path")?),
             "-h" | "--help" => {
-                println!("usage: exzec [--live] [--detach] [--server token@host:port]... [-f exfile] [task]");
+                println!("usage: exzec [--live] [--detach] [--server token@host:port]... [-f exfile] [task] [args]...");
                 println!("       exzec ps | attach <job>");
                 println!("no task: list tasks from the nearest exfile");
                 return Ok(0);
             }
-            f if f.starts_with('-') => bail!("unknown flag '{f}'"),
+            f if f.starts_with('-') && pos.is_empty() => bail!("unknown flag '{f}'"),
             t => pos.push(t.to_string()),
         }
     }
@@ -66,7 +65,8 @@ async fn run() -> Result<i32> {
         let (root, file_servers) = match &found {
             Ok((root, file)) => {
                 let mut v: Vec<String> = Vec::new();
-                for s in exfile::parse(&std::fs::read_to_string(file)?)?.into_iter().flat_map(|t| t.servers) {
+                let tasks = exfile::parse(&std::fs::read_to_string(file)?, &exfile::dotenv(root))?;
+                for s in tasks.into_iter().flat_map(|t| t.servers) {
                     if !v.contains(&s) {
                         v.push(s);
                     }
@@ -87,7 +87,7 @@ async fn run() -> Result<i32> {
     }
     let (root, file) = found?;
     let text = std::fs::read_to_string(&file)?;
-    let tasks = exfile::parse(&text)?;
+    let tasks = exfile::parse(&text, &exfile::dotenv(&root))?;
     let Some(name) = pos.first() else {
         for t in &tasks {
             let x = if t.replicas > 1 { format!(" x{}", t.replicas) } else { String::new() };
@@ -96,27 +96,39 @@ async fn run() -> Result<i32> {
         }
         return Ok(0);
     };
-    if pos.len() > 1 {
-        bail!("one task at a time");
+    let chain = exfile::schedule(&tasks, name).with_context(|| format!("in {}", file.display()))?;
+    let mut code = 0;
+    for (i, t) in chain.iter().enumerate() {
+        let last = i + 1 == chain.len();
+        let mut task = (*t).clone();
+        if last {
+            task.live |= live_flag;
+            task.args = pos[1..].to_vec();
+        }
+        if task.script.is_empty() {
+            continue;
+        }
+        code = run_one(&root, task, &cli_servers, last && detach).await?;
+        if code != 0 {
+            break;
+        }
     }
-    let mut task = tasks
-        .into_iter()
-        .find(|t| &t.name == name)
-        .with_context(|| format!("no task '{name}' in {}", file.display()))?;
-    task.live |= live_flag;
+    Ok(code)
+}
+
+async fn run_one(root: &Path, task: Task, cli_servers: &[String], detach: bool) -> Result<i32> {
     if task.live && task.replicas > 1 {
         bail!("live workspace requires replicas = 1");
     }
     if task.live && detach {
         bail!("detach requires the sync workspace");
     }
-
-    let entries = pick_entries(&cli_servers, &task.servers);
+    let entries = pick_entries(cli_servers, &task.servers);
     if entries.is_empty() {
         if detach {
             bail!("detach needs a server");
         }
-        return run_local(&root, &task).await;
+        return run_local(root, &task).await;
     }
     let servers: Vec<Server> = entries.iter().map(|e| parse_entry(e)).collect();
     let want = (task.replicas as usize).min(servers.len());
@@ -136,7 +148,7 @@ async fn run() -> Result<i32> {
     let scan = if task.live {
         None
     } else {
-        let root = root.clone();
+        let root = root.to_path_buf();
         Some(Arc::new(tokio::task::spawn_blocking(move || cas::scan(&root)).await??))
     };
     let k = picked.len() as u32;
@@ -148,7 +160,7 @@ async fn run() -> Result<i32> {
     let mut rank0 = 0u32;
     for (i, (conn, srv)) in picked.into_iter().enumerate() {
         let ranks = task.replicas / k + u32::from((i as u32) < task.replicas % k);
-        let (task, root, main, scan) = (task.clone(), root.clone(), main.clone(), scan.clone());
+        let (task, root, main, scan) = (task.clone(), root.to_path_buf(), main.clone(), scan.clone());
         sessions.push(tokio::spawn(session(conn, srv, root, task, rank0, ranks, main, scan, detach)));
         rank0 += ranks;
     }
@@ -240,7 +252,7 @@ async fn stream_job(r: &mut OwnedReadHalf, root: &Path, world: u32) -> Result<i3
                         std::fs::create_dir_all(p)?;
                     }
                     let f = std::fs::File::create(&abs)?;
-                    f.set_permissions(std::fs::Permissions::from_mode((mode & 0o777) | 0o600))?;
+                    exzet::set_mode(&abs, (mode & 0o777) | 0o600)?;
                     eprintln!("exzec: output {path}");
                     if len > 0 {
                         pending_file = Some((len, 0, f));

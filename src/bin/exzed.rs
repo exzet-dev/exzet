@@ -5,7 +5,6 @@ use exzet::exfile::Task;
 use exzet::proto::{self, JobInfo, Msg};
 use exzet::rand_hex;
 use std::collections::HashMap;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -61,7 +60,8 @@ async fn main() -> Result<()> {
     if let Some(enable) = svc {
         return service(enable, &listen, &state, token_arg, containers);
     }
-    if containers && !rustix::process::geteuid().is_root() {
+    #[cfg(unix)]
+    if containers && !exzet::is_root() {
         let root_sock = std::fs::metadata("/var/run/docker.sock")
             .is_ok_and(|m| std::os::unix::fs::MetadataExt::uid(&m) == 0);
         if root_sock {
@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
     }
     std::fs::create_dir_all(&state).with_context(|| format!("creating {}", state.display()))?;
     for e in std::fs::read_dir(state.join("jobs")).into_iter().flatten().flatten() {
-        let _ = rustix::mount::unmount(&e.path().join("work"), rustix::mount::UnmountFlags::DETACH);
+        unmount_work(&e.path().join("work"));
         let _ = std::fs::remove_dir_all(e.path());
     }
     for e in std::fs::read_dir(&state).into_iter().flatten().flatten() {
@@ -86,11 +86,16 @@ async fn main() -> Result<()> {
             if f.metadata().and_then(|m| m.modified()).is_ok_and(|t| t < old) { let _ = std::fs::remove_file(f.path()); }
         }
     }
+    #[cfg(target_os = "linux")]
     for e in std::fs::read_dir(Path::new(cell::CG_ROOT).join("exzet")).into_iter().flatten().flatten() {
         let _ = std::fs::write(e.path().join("cgroup.kill"), "1");
         let _ = std::fs::remove_dir(e.path());
     }
-    let _ = Command::new("sh").args(["-c", "docker rm -f $(docker ps -aq -f name=^exzet-)"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    if let Ok(out) = Command::new("docker").args(["ps", "-aq", "-f", "name=^exzet-"]).output() {
+        for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+            let _ = Command::new("docker").args(["rm", "-f", id]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        }
+    }
     let token = match token_arg {
         Some(t) => t,
         None => load_or_make_token(&state)?,
@@ -107,8 +112,13 @@ async fn main() -> Result<()> {
     let l = TcpListener::bind(&listen).await.with_context(|| format!("binding {listen}"))?;
     eprintln!("exzed listening on {listen}");
     eprintln!("server entry: {token}@{}:{}", host(), l.local_addr()?.port());
-    if !rustix::process::geteuid().is_root() {
+    #[cfg(target_os = "linux")]
+    if !exzet::is_root() {
         eprintln!("exzed: not root, limits and live mode off");
+    }
+    #[cfg(target_os = "macos")]
+    if !exzet::is_root() {
+        eprintln!("exzed: not root, live mode off");
     }
     loop {
         let (conn, peer) = l.accept().await?;
@@ -122,7 +132,24 @@ async fn main() -> Result<()> {
 }
 
 fn service(enable: bool, listen: &str, state: &Path, token: Option<String>, containers: bool) -> Result<()> {
-    let root = rustix::process::geteuid().is_root();
+    if enable {
+        std::fs::create_dir_all(state)?;
+        if let Some(t) = &token {
+            std::fs::write(state.join("token"), t)?;
+            exzet::set_mode(&state.join("token"), 0o600)?;
+        }
+    }
+    install(enable, listen, state, containers)?;
+    if enable {
+        let token = load_or_make_token(state)?;
+        eprintln!("server entry: {token}@{}:{}", host(), listen.rsplit(':').next().unwrap_or("7433"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn install(enable: bool, listen: &str, state: &Path, containers: bool) -> Result<()> {
+    let root = exzet::is_root();
     let run = |args: &[&str]| -> Result<bool> {
         let mut c = Command::new("systemctl");
         if !root {
@@ -144,12 +171,6 @@ fn service(enable: bool, listen: &str, state: &Path, token: Option<String>, cont
         let _ = run(&["daemon-reload"]);
         return Ok(());
     }
-    std::fs::create_dir_all(state)?;
-    if let Some(t) = &token {
-        std::fs::write(state.join("token"), t)?;
-        std::fs::set_permissions(state.join("token"), std::fs::Permissions::from_mode(0o600))?;
-    }
-    let token = load_or_make_token(state)?;
     std::fs::create_dir_all(unit.parent().context("no unit dir")?)?;
     let wanted = if root { "multi-user.target" } else { "default.target" };
     std::fs::write(
@@ -165,8 +186,74 @@ fn service(enable: bool, listen: &str, state: &Path, token: Option<String>, cont
     if !root && !Command::new("loginctl").arg("enable-linger").status()?.success() {
         eprintln!("exzed: enable-linger failed, service stops at logout");
     }
-    eprintln!("server entry: {token}@{}:{}", host(), listen.rsplit(':').next().unwrap_or("7433"));
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn install(enable: bool, listen: &str, state: &Path, containers: bool) -> Result<()> {
+    let root = exzet::is_root();
+    let plist = if root {
+        PathBuf::from("/Library/LaunchDaemons/net.exzet.exzed.plist")
+    } else {
+        PathBuf::from(std::env::var("HOME").context("no HOME")?).join("Library/LaunchAgents/net.exzet.exzed.plist")
+    };
+    let domain = if root { "system".to_string() } else { format!("gui/{}", rustix::process::getuid().as_raw()) };
+    let _ = Command::new("launchctl")
+        .args(["bootout", &domain, &plist.to_string_lossy()])
+        .stdout(Stdio::null()).stderr(Stdio::null()).status();
+    if !enable {
+        std::fs::remove_file(&plist).context("no exzed service at this privilege level")?;
+        return Ok(());
+    }
+    std::fs::create_dir_all(plist.parent().context("no plist dir")?)?;
+    std::fs::write(
+        &plist,
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict>\n<key>Label</key><string>net.exzet.exzed</string>\n<key>ProgramArguments</key><array><string>{}</string><string>--listen</string><string>{listen}</string><string>--state</string><string>{}</string><string>--containers</string><string>{containers}</string></array>\n<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>\n</dict></plist>\n",
+            std::env::current_exe()?.display(), state.display()
+        ),
+    )?;
+    if !Command::new("launchctl").args(["bootstrap", &domain, &plist.to_string_lossy()]).status()?.success() {
+        bail!("launchctl bootstrap failed");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn install(enable: bool, listen: &str, state: &Path, containers: bool) -> Result<()> {
+    if !enable {
+        let _ = Command::new("schtasks").args(["/End", "/TN", "exzed"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        if !Command::new("schtasks").args(["/Delete", "/F", "/TN", "exzed"]).status()?.success() {
+            bail!("no exzed task");
+        }
+        return Ok(());
+    }
+    let tr = format!(
+        "\"{}\" --listen {listen} --state \"{}\" --containers {containers}",
+        std::env::current_exe()?.display(), state.display()
+    );
+    let admin = Command::new("schtasks")
+        .args(["/Create", "/F", "/TN", "exzed", "/SC", "ONSTART", "/RU", "SYSTEM", "/TR", &tr])
+        .status()?.success();
+    if !admin
+        && !Command::new("schtasks").args(["/Create", "/F", "/TN", "exzed", "/SC", "ONLOGON", "/TR", &tr]).status()?.success()
+    {
+        bail!("schtasks create failed");
+    }
+    let _ = Command::new("schtasks").args(["/Run", "/TN", "exzed"]).status();
+    Ok(())
+}
+
+fn unmount_work(p: &Path) {
+    #[cfg(target_os = "linux")]
+    let _ = rustix::mount::unmount(p, rustix::mount::UnmountFlags::DETACH);
+    #[cfg(target_os = "macos")]
+    let _ = Command::new("umount").arg("-f").arg(p).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        let _ = Command::new("umount").args(["-f", s.trim_end_matches('\\')]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
 }
 
 fn host() -> String {
@@ -178,17 +265,28 @@ fn host() -> String {
             s.connect("1.1.1.1:53").ok()?;
             Some(s.local_addr().ok()?.ip().to_string())
         })
-        .unwrap_or_else(|| rustix::system::uname().nodename().to_string_lossy().into_owned())
+        .unwrap_or_else(|| {
+            #[cfg(unix)]
+            return rustix::system::uname().nodename().to_string_lossy().into_owned();
+            #[cfg(windows)]
+            std::env::var("COMPUTERNAME").unwrap_or_else(|_| "localhost".into())
+        })
 }
 
 fn default_state_dir() -> PathBuf {
-    if rustix::process::geteuid().is_root() {
-        PathBuf::from("/var/lib/exzet")
-    } else {
-        std::env::var_os("XDG_STATE_HOME").map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-            .unwrap_or_else(|| PathBuf::from("/tmp")).join("exzet")
+    #[cfg(unix)]
+    if exzet::is_root() {
+        return PathBuf::from("/var/lib/exzet");
     }
+    #[cfg(windows)]
+    return std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("exzet");
+    #[cfg(unix)]
+    std::env::var_os("XDG_STATE_HOME").map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .unwrap_or_else(|| PathBuf::from("/tmp")).join("exzet")
 }
 
 fn load_or_make_token(state: &Path) -> Result<String> {
@@ -198,7 +296,7 @@ fn load_or_make_token(state: &Path) -> Result<String> {
     }
     let t = rand_hex(16);
     std::fs::write(&tf, &t)?;
-    std::fs::set_permissions(&tf, std::fs::Permissions::from_mode(0o600))?;
+    exzet::set_mode(&tf, 0o600)?;
     Ok(t)
 }
 
@@ -272,16 +370,16 @@ async fn run_job(
 ) -> Result<i32> {
     let job = rand_hex(6);
     let jobdir = d.state.join("jobs").join(&job);
-    let work = jobdir.join("work");
+    let mut work = jobdir.join("work");
 
     let mut ro = Some(r);
-    let res = prepare(d, &mut ro, w, &task, rank0, ranks, detach, &work).await;
+    let res = prepare(d, &mut ro, w, &task, rank0, ranks, detach, &mut work).await;
     if let Err(e) = &res {
         let _ = proto::send_msg(w, &Msg::Err { msg: format!("{e:#}") }).await;
         if let Some(r) = ro.take() {
             drain(r).await;
         }
-        let _ = rustix::mount::unmount(&work, rustix::mount::UnmountFlags::DETACH);
+        unmount_work(&work);
         let _ = std::fs::remove_dir_all(&jobdir);
         return res.map(|_| 0);
     }
@@ -331,7 +429,7 @@ async fn run_job(
     if let Err(e) = &res {
         let _ = proto::send_msg(w, &Msg::Err { msg: format!("{e:#}") }).await;
     }
-    let _ = rustix::mount::unmount(&work, rustix::mount::UnmountFlags::DETACH);
+    unmount_work(&work);
     let _ = std::fs::remove_dir_all(&jobdir);
     res
 }
@@ -344,7 +442,7 @@ async fn prepare(
     rank0: u32,
     ranks: u32,
     detach: bool,
-    work: &Path,
+    work: &mut PathBuf,
 ) -> Result<()> {
     if ranks == 0 || rank0.checked_add(ranks).is_none_or(|e| e > task.replicas) {
         bail!("bad rank range");
@@ -358,7 +456,7 @@ async fn prepare(
     if task.live && detach {
         bail!("detach requires the sync workspace");
     }
-    std::fs::create_dir_all(work)?;
+    std::fs::create_dir_all(&work)?;
     if let Some(image) = &task.image {
         if !d.containers {
             bail!("containers: false on this server");
@@ -381,10 +479,13 @@ async fn prepare(
         }
     }
     if task.live {
-        if !rustix::process::geteuid().is_root() {
+        #[cfg(unix)]
+        if !exzet::is_root() {
             bail!("live workspace requires exzed running as root");
         }
-        let gate = TcpListener::bind("127.0.0.1:0").await?;
+        let gate = TcpListener::bind(if cfg!(windows) { "127.0.0.1:2049" } else { "127.0.0.1:0" })
+            .await
+            .context(if cfg!(windows) { "binding 127.0.0.1:2049 (the Windows NFS client only mounts port 2049)" } else { "binding gate" })?;
         let port = gate.local_addr()?.port();
         let tun = rand_hex(12);
         let (tx, rx) = oneshot::channel();
@@ -398,21 +499,56 @@ async fn prepare(
             }
         };
         tokio::spawn(proto::mux_acceptor(tconn, gate));
-        let _ = tokio::process::Command::new("modprobe").arg("nfs").status().await;
-        // kernel mounts; nolock skips NLM
-        let data = std::ffi::CString::new(format!(
-            "vers=3,proto=tcp,addr=127.0.0.1,port={port},mountvers=3,mountproto=tcp,mountport={port},nolock,soft,timeo=100,retrans=3,actimeo=1"
-        ))?;
-        let target = work.to_path_buf();
-        let mountres = tokio::task::spawn_blocking(move || {
-            rustix::mount::mount("127.0.0.1:/", &target, "nfs", rustix::mount::MountFlags::empty(), Some(data.as_c_str()))
-        })
-        .await;
-        match mountres {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => bail!("nfs mount failed: {e}"),
-            Err(e) => bail!("nfs mount failed: {e}"),
+        #[cfg(target_os = "linux")]
+        {
+            let _ = tokio::process::Command::new("modprobe").arg("nfs").status().await;
+            // kernel mounts; nolock skips NLM
+            let data = std::ffi::CString::new(format!(
+                "vers=3,proto=tcp,addr=127.0.0.1,port={port},mountvers=3,mountproto=tcp,mountport={port},nolock,soft,timeo=100,retrans=3,actimeo=1"
+            ))?;
+            let target = work.clone();
+            let mountres = tokio::task::spawn_blocking(move || {
+                rustix::mount::mount("127.0.0.1:/", &target, "nfs", rustix::mount::MountFlags::empty(), Some(data.as_c_str()))
+            })
+            .await;
+            match mountres {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => bail!("nfs mount failed: {e}"),
+                Err(e) => bail!("nfs mount failed: {e}"),
+            }
         }
+        #[cfg(target_os = "macos")]
+        {
+            let opts = format!("nolocks,vers=3,tcp,soft,port={port},mountport={port},actimeo=1");
+            let st = tokio::process::Command::new("mount_nfs")
+                .args(["-o", &opts, "127.0.0.1:/"]).arg(&*work)
+                .status().await.context("running mount_nfs")?;
+            if !st.success() {
+                bail!("mount_nfs failed");
+            }
+        }
+        #[cfg(windows)]
+        {
+            let _ = port;
+            let drive = ('D'..='Z')
+                .rev()
+                .map(|l| format!("{l}:"))
+                .find(|d| !Path::new(&format!("{d}\\")).exists())
+                .context("no free drive letter")?;
+            let st = tokio::process::Command::new("mount")
+                .args(["-o", "anon,nolock", "127.0.0.1:/", &drive])
+                .status().await
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::NotFound => anyhow::anyhow!("mount not found - enable the 'client for nfs' windows feature"),
+                    _ => e.into(),
+                })?;
+            if !st.success() {
+                bail!("nfs mount of {drive} failed (is 'client for nfs' enabled?)");
+            }
+            *work = PathBuf::from(format!("{drive}\\"));
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        bail!("live workspace unsupported on this platform");
     } else {
         let r = ro.as_mut().context("connection consumed")?;
         let files = match proto::recv_msg(r).await? {
@@ -454,7 +590,7 @@ async fn prepare(
         }
         let d2 = d.clone();
         let files2 = files;
-        let work2 = work.to_path_buf();
+        let work2 = work.clone();
         tokio::task::spawn_blocking(move || d2.store.hydrate(&files2, &work2)).await??;
     }
     if !detach {
@@ -487,14 +623,14 @@ async fn run_task<W: AsyncWrite + Unpin>(
             let meta = abs.metadata()?;
             proto::send_msg(w, &Msg::OutFile {
                 path: rel,
-                mode: meta.permissions().mode() & 0o777,
+                mode: exzet::mode_of(&meta),
                 len: meta.len(),
             })
             .await?;
             proto::send_file(w, &abs).await?;
         }
     }
-    let _ = rustix::mount::unmount(work, rustix::mount::UnmountFlags::DETACH);
+    unmount_work(work);
     proto::send_msg(w, &Msg::Exit { code }).await?;
     Ok(code)
 }

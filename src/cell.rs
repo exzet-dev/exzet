@@ -7,7 +7,9 @@ use std::time::Duration;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
+#[cfg(target_os = "linux")]
 pub const CG_ROOT: &str = "/sys/fs/cgroup";
+const CELL: &str = "/.exzet-cell";
 
 pub type Chunk = (u32, bool, Vec<u8>);
 
@@ -21,11 +23,15 @@ pub struct Job<'a> {
     pub pipe: bool,
 }
 
-#[derive(Clone)]
+#[derive(Default)]
 struct Handle {
     pid: Option<u32>,
-    cgroup: Option<PathBuf>,
     container: Option<String>,
+    file: Option<PathBuf>,
+    #[cfg(target_os = "linux")]
+    cgroup: Option<PathBuf>,
+    #[cfg(windows)]
+    job: Option<isize>,
 }
 
 pub async fn docker_ready() -> bool {
@@ -34,10 +40,15 @@ pub async fn docker_ready() -> bool {
 }
 
 pub fn limits_off() -> bool {
-    !rustix::process::geteuid().is_root()
-        || !Path::new(CG_ROOT).join("cgroup.controllers").is_file()
+    #[cfg(target_os = "linux")]
+    return !crate::is_root() || !Path::new(CG_ROOT).join("cgroup.controllers").is_file();
+    #[cfg(all(unix, not(target_os = "linux")))]
+    return true;
+    #[cfg(windows)]
+    false
 }
 
+#[cfg(target_os = "linux")]
 fn make_cgroup(name: &str, task: &Task) -> Option<PathBuf> {
     if limits_off() {
         return None;
@@ -57,6 +68,59 @@ fn make_cgroup(name: &str, task: &Task) -> Option<PathBuf> {
     Some(cg)
 }
 
+fn script_file(t: &Task, id: &str, rank: u32, ext: &str) -> Result<PathBuf> {
+    let p = std::env::temp_dir().join(format!("exzet-{id}-{rank}{ext}"));
+    fs::write(&p, format!("{}\n", t.script))?;
+    crate::set_mode(&p, 0o755)?;
+    Ok(p)
+}
+
+fn interp(line: &str) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    for t in line.trim_start_matches("#!").split_whitespace() {
+        let base = t.rsplit('/').next().unwrap_or(t);
+        if v.is_empty() && base == "env" {
+            continue;
+        }
+        v.push(if v.is_empty() { base.to_string() } else { t.to_string() });
+    }
+    if v.is_empty() {
+        v.push("sh".to_string());
+    }
+    v
+}
+
+fn invoke(t: &Task, id: &str, rank: u32) -> Result<(Vec<String>, Option<PathBuf>)> {
+    let docker = t.image.is_some();
+    let mut file = None;
+    let mut argv: Vec<String>;
+    if t.script.starts_with("#!") {
+        let f = script_file(t, id, rank, "")?;
+        argv = if docker {
+            vec![CELL.to_string()]
+        } else if cfg!(windows) {
+            let mut v = interp(t.script.lines().next().unwrap_or(""));
+            v.push(f.display().to_string());
+            v
+        } else {
+            vec![f.display().to_string()]
+        };
+        file = Some(f);
+    } else if !t.shell.is_empty() {
+        argv = t.shell.split_whitespace().map(str::to_string).collect();
+        argv.push(t.script.clone());
+    } else if docker || cfg!(unix) {
+        argv = vec!["/bin/sh".into(), "-euc".into(), t.script.clone(), t.name.clone()];
+    } else {
+        let f = script_file(t, id, rank, ".ps1")?;
+        argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File"].map(String::from).into();
+        argv.push(f.display().to_string());
+        file = Some(f);
+    }
+    argv.extend(t.args.iter().cloned());
+    Ok((argv, file))
+}
+
 fn spawn(j: &Job, rank: u32) -> Result<(Child, Handle)> {
     let envs = [
         ("EXZET_JOB", j.id.to_string()),
@@ -64,13 +128,19 @@ fn spawn(j: &Job, rank: u32) -> Result<(Child, Handle)> {
         ("EXZET_WORLD", j.task.replicas.to_string()),
         ("EXZET_MAIN", j.main.to_string()),
     ];
-    let (mut cmd, mut handle) = match &j.task.image {
+    let (argv, file) = invoke(j.task, j.id, rank)?;
+    let mut handle = Handle::default();
+    handle.file = file;
+    let mut cmd = match &j.task.image {
         Some(image) => {
             let name = format!("exzet-{}-{rank}", j.id);
             let mut cmd = Command::new("docker");
             cmd.args(["run", "--rm", "--network", "host", "--name", &name]).arg("-v")
-                .arg(format!("{}:/work", j.dir.display())).args(["-w", "/work", "--entrypoint", "/bin/sh"]);
-            for (k, v) in &envs {
+                .arg(format!("{}:/work", j.dir.display())).args(["-w", "/work", "--entrypoint", &argv[0]]);
+            if let Some(f) = &handle.file {
+                cmd.arg("-v").arg(format!("{}:{CELL}:ro", f.display()));
+            }
+            for (k, v) in j.task.env.iter().map(|(k, v)| (k.as_str(), v)).chain(envs.iter().map(|(k, v)| (*k, v))) {
                 cmd.arg("-e").arg(format!("{k}={v}"));
             }
             if let Some(c) = j.task.cpus {
@@ -82,21 +152,38 @@ fn spawn(j: &Job, rank: u32) -> Result<(Child, Handle)> {
             if j.task.gpus > 0 {
                 cmd.arg("--gpus").arg(j.task.gpus.to_string());
             }
-            cmd.arg(image).args(["-euc", &j.task.script]);
-            (cmd, Handle { pid: None, cgroup: None, container: Some(name) })
+            cmd.arg(image).args(&argv[1..]);
+            handle.container = Some(name);
+            cmd
         }
         None => {
-            let cgroup = make_cgroup(&format!("{}-{rank}", j.id), j.task);
-            let script = match &cgroup {
-                Some(cg) => format!("echo $$ >{}/cgroup.procs\n{}", cg.display(), j.task.script),
-                None => j.task.script.clone(),
-            };
-            let mut cmd = Command::new("/bin/sh");
-            cmd.arg("-euc").arg(script).current_dir(j.dir).envs(envs);
-            (cmd, Handle { pid: None, cgroup, container: None })
+            let mut cmd = Command::new(&argv[0]);
+            cmd.args(&argv[1..]).current_dir(j.dir);
+            for (k, v) in &j.task.env {
+                cmd.env(k, v);
+            }
+            cmd.envs(envs);
+            #[cfg(target_os = "linux")]
+            {
+                handle.cgroup = make_cgroup(&format!("{}-{rank}", j.id), j.task);
+                if let Some(cg) = &handle.cgroup {
+                    use std::os::unix::ffi::OsStringExt;
+                    let procs = std::ffi::CString::new(cg.join("cgroup.procs").into_os_string().into_vec())?;
+                    unsafe {
+                        cmd.pre_exec(move || {
+                            let fd = rustix::fs::open(procs.as_c_str(), rustix::fs::OFlags::WRONLY, rustix::fs::Mode::empty())?;
+                            rustix::io::write(&fd, b"0")?;
+                            Ok(())
+                        });
+                    }
+                }
+            }
+            cmd
         }
     };
-    cmd.stdin(Stdio::null()).process_group(0).kill_on_drop(true);
+    cmd.stdin(Stdio::null()).kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
     if j.pipe {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     } else {
@@ -104,7 +191,49 @@ fn spawn(j: &Job, rank: u32) -> Result<(Child, Handle)> {
     }
     let child = cmd.spawn().context("spawning cell")?;
     handle.pid = child.id();
+    #[cfg(windows)]
+    if handle.container.is_none() {
+        handle.job = assign_job(&child, j.task);
+    }
     Ok((child, handle))
+}
+
+#[cfg(windows)]
+fn assign_job(child: &Child, t: &Task) -> Option<isize> {
+    use windows_sys::Win32::System::JobObjects::*;
+    let ph = child.raw_handle()?;
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return None;
+        }
+        let mut ext: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        ext.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if let Some(m) = t.mem_bytes {
+            ext.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+            ext.JobMemoryLimit = m as usize;
+        }
+        SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            (&raw const ext).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        );
+        if let Some(c) = t.cpus {
+            let total = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
+            let mut rate: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = std::mem::zeroed();
+            rate.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+            rate.Anonymous.CpuRate = (c.min(total) * 10000 / total).max(1);
+            SetInformationJobObject(
+                job,
+                JobObjectCpuRateControlInformation,
+                (&raw const rate).cast(),
+                size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
+            );
+        }
+        AssignProcessToJobObject(job, ph);
+        Some(job as isize)
+    }
 }
 
 pub async fn run(
@@ -170,9 +299,19 @@ pub async fn run(
             p.abort();
         }
     }
-    for cg in handles.iter().filter_map(|h| h.cgroup.as_ref()) {
-        let _ = fs::write(cg.join("cgroup.kill"), "1");
-        let _ = fs::remove_dir(cg);
+    for h in &handles {
+        #[cfg(target_os = "linux")]
+        if let Some(cg) = &h.cgroup {
+            let _ = fs::write(cg.join("cgroup.kill"), "1");
+            let _ = fs::remove_dir(cg);
+        }
+        #[cfg(windows)]
+        if let Some(job) = h.job {
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(job as _) };
+        }
+        if let Some(f) = &h.file {
+            let _ = fs::remove_file(f);
+        }
     }
     if timed_out {
         code = 124;
@@ -192,17 +331,28 @@ fn kill_tree(h: &Handle) {
             .spawn();
         return;
     }
+    #[cfg(target_os = "linux")]
     if let Some(cg) = &h.cgroup {
         let _ = fs::write(cg.join("cgroup.kill"), "1");
     }
+    #[cfg(unix)]
     if let Some(pid) = h.pid.and_then(|p| rustix::process::Pid::from_raw(p as i32)) {
         let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+    #[cfg(windows)]
+    if let Some(job) = h.job {
+        unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(job as _, 1) };
     }
 }
 
 fn exit_code(st: std::process::ExitStatus) -> i32 {
-    use std::os::unix::process::ExitStatusExt;
-    st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(9))
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(9))
+    }
+    #[cfg(windows)]
+    st.code().unwrap_or(1)
 }
 
 async fn pump(
